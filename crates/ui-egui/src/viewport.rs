@@ -9769,7 +9769,8 @@ mod grid_plane_tests {
         app.cam.yaw = 0.0;
         app.cam.target = Vec3::ZERO;
         app.cam.distance = 100.0;
-        let under = build_sketch_scene(&app, &projection(&app, rect)).under;
+        let scene = build_sketch_scene(&app, &projection(&app, rect));
+        let under = &scene.under;
         // Each line of the grid: two points, a colour and a width.
         let segments: Vec<([f32; 3], [f32; 3], u8)> = under
             .as_chunks::<32>()
@@ -9777,7 +9778,9 @@ mod grid_plane_tests {
             .iter()
             .map(|l| {
                 let point = |at: usize| [0, 4, 8].map(|i| f32::from_le_bytes(l[at + i..at + i + 4].try_into().unwrap()));
-                (point(0), point(12), l[27])
+                let index = u32::from_le_bytes(l[24..28].try_into().unwrap());
+                let alpha = scene.palette.get(crate::gpu::PaletteIndex(index)).map_or(0, |c| c[3]);
+                (point(0), point(12), alpha)
             })
             .collect();
         assert!(!segments.is_empty(), "the grid is drawn");
@@ -9884,8 +9887,14 @@ mod grid_plane_tests {
         let faded = build_sketch_scene(&app, &proj).merged();
         // The same grid at full strength: every piece of it opaque.
         let mut full = faded.clone();
-        for piece in full.under.as_chunks_mut::<32>().0 {
-            piece[27] = 255;
+        let palette = std::sync::Arc::make_mut(&mut full.palette);
+        for piece in full.under.as_chunks::<32>().0 {
+            let index = u32::from_le_bytes(piece[24..28].try_into().unwrap());
+            let slot = crate::gpu::PaletteIndex(index);
+            if let Some(mut colour) = palette.get(slot) {
+                colour[3] = 255;
+                palette.set(slot, colour);
+            }
         }
         let (Some(faded), Some(full)) = (render(faded), render(full)) else {
             eprintln!("skipping: no GPU adapter");
