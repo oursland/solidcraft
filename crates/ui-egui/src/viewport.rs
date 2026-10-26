@@ -713,10 +713,12 @@ struct ResolvedAppearance {
 /// appearance state they were resolved from.
 #[derive(Default)]
 struct AppearanceCache {
-    /// The document the face index below was built from.
-    doc: Option<usize>,
+    /// The document the face index below was built from, and whether components coloured bodies.
+    doc: Option<(usize, bool)>,
     /// A hash of each body's face appearances, so a body's look is keyed without scanning them.
     faces: std::collections::HashMap<String, u64>,
+    /// Each body's appearance key, reused while the document and its geometry are unchanged.
+    keys: std::collections::HashMap<String, u64>,
     bodies: std::collections::HashMap<String, (u64, std::sync::Arc<ResolvedAppearance>)>,
     /// Bodies actually resolved (the test asserts an unrelated edit resolves only its body).
     #[cfg(test)]
@@ -969,6 +971,11 @@ fn set_palette_color(
     slot: crate::gpu::PaletteIndex,
     rgba: [u8; 4],
 ) {
+    // The scene palette starts as a copy of the arena's entries: an unchanged slot is already
+    // right, and most rebuilds (visibility, LOD, section) change none.
+    if arena.get(slot) == Some(rgba) {
+        return;
+    }
     arena.set(slot, rgba);
     std::sync::Arc::make_mut(palette).set(slot, rgba);
 }
@@ -1161,19 +1168,20 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     // Allocate every body's slots before the scene's palette is copied, so the stable prefix
     // covers them; the colours themselves are written in the loop below, into both the arena
     // and the scene's palette.
-    for b in &shown {
-        arena.body(&b.name, b.body.face_count());
-    }
+    let slots: Vec<_> = shown.iter().map(|b| arena.body(&b.name, b.body.face_count())).collect();
     let mut sc = GpuScene::with_palette(crate::gpu::Palette::with_stable(arena.entries()));
     // Resolve looks once per body and appearance state: a theme, visibility or LOD rebuild does
     // not scan the whole design's face appearances again.
     let mut appearance = app.viewport.appearance.lock().unwrap_or_else(|e| e.into_inner());
     let doc = std::sync::Arc::as_ptr(&s.doc) as usize;
-    if appearance.doc != Some(doc) {
-        appearance.doc = Some(doc);
-        appearance.faces = face_appearance_hashes(&s.doc);
-    }
     let colored = s.colored_components.is_some();
+    if appearance.doc != Some((doc, colored)) {
+        appearance.doc = Some((doc, colored));
+        appearance.faces = face_appearance_hashes(&s.doc);
+        // A design or colouring edit can key any body differently; the resolved looks whose
+        // key comes back unchanged are still reused.
+        appearance.keys.clear();
+    }
     // The blocks the last scene built, reused when their bodies come back as they were.
     let mut kept = app.viewport.blocks.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
     let mut made: std::collections::HashMap<u64, CachedBlock> = std::collections::HashMap::new();
@@ -1184,9 +1192,16 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     // the CPU.
     let mut instances = Instances::new(app, &shown, shaded);
     let mut thread_budget = solidcraft_engine::cosmetic_threads::Budget::default();
-    for b in shown {
+    for (b, slots) in shown.into_iter().zip(slots) {
         let faded = body_faded(app, b, &active_bodies);
-        let identity = body_appearance_key(&s.doc, b, &appearance.faces, colored);
+        let identity = match appearance.keys.get(&b.name).copied() {
+            Some(key) => key,
+            None => {
+                let key = body_appearance_key(&s.doc, b, &appearance.faces, colored);
+                appearance.keys.insert(b.name.clone(), key);
+                key
+            }
+        };
         let resolved = match appearance.bodies.get(&b.name) {
             Some((key, resolved)) if *key == identity => resolved.clone(),
             _ => {
@@ -1199,7 +1214,6 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
                 resolved
             }
         };
-        let slots = arena.body(&b.name, b.body.face_count());
         set_palette_color(&mut arena, &mut sc.palette, slots.edge, edge_col);
         set_palette_color(&mut arena, &mut sc.palette, slots.hidden_edge, hidden_col);
         if app.preferences.cosmetic_threads
@@ -1322,6 +1336,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
         *m = body_tris;
     }
     appearance.bodies.retain(|name, _| names.contains(name));
+    appearance.keys.retain(|name, _| names.contains(name));
     if let Ok(mut b) = app.viewport.blocks.lock() {
         *b = made;
     }

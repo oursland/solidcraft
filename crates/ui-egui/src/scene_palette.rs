@@ -105,6 +105,11 @@ impl PaletteArena {
         PaletteIndex(i)
     }
 
+    /// The colour at `slot`, if it is allocated.
+    pub fn get(&self, slot: PaletteIndex) -> Option<[u8; 4]> {
+        self.entries.get(slot.0 as usize).copied()
+    }
+
     /// Set a slot's colour; out-of-range slots are ignored.
     pub fn set(&mut self, slot: PaletteIndex, rgba: [u8; 4]) {
         if let Some(entry) = self.entries.get_mut(slot.0 as usize) {
