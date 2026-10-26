@@ -1162,8 +1162,8 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     let shown: Vec<&solidcraft_engine::doc::ModelBody> =
         st.bodies.iter().filter(|b| app.session.body_visible(&b.name) && !app.preview.effective_replaced().contains(&b.name)).collect();
     let mut arena = app.viewport.palette.lock().unwrap_or_else(|e| e.into_inner());
-    let names: std::collections::HashSet<String> = shown.iter().map(|b| b.name.clone()).collect();
-    arena.sync(&names);
+    let shown_names: Vec<&str> = shown.iter().map(|b| b.name.as_str()).collect();
+    arena.sync(shown_names.iter().copied());
     // Allocate every body's slots before the scene's palette is copied, so the stable prefix
     // covers them; the colours themselves are written in the loop below, into both the arena
     // and the scene's palette.
@@ -1334,8 +1334,12 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     if let Ok(mut m) = app.viewport.body_tris.lock() {
         *m = body_tris;
     }
-    appearance.bodies.retain(|name, _| names.contains(name));
-    appearance.keys.retain(|name, _| names.contains(name));
+    // Every shown body has its entries, so only a larger map holds bodies no longer shown.
+    if appearance.bodies.len() > shown_names.len() || appearance.keys.len() > shown_names.len() {
+        let names: std::collections::HashSet<&str> = shown_names.iter().copied().collect();
+        appearance.bodies.retain(|name, _| names.contains(name.as_str()));
+        appearance.keys.retain(|name, _| names.contains(name.as_str()));
+    }
     if let Ok(mut b) = app.viewport.blocks.lock() {
         *b = made;
     }

@@ -191,7 +191,8 @@ fn assembly_scene_rebuild_cost() {
         let selection_rebuilds = crate::viewport::display_scene_keys(&h.app, &proj).0 != key;
         let selection = if selection_rebuilds { ms(|| drop(crate::viewport::build_scene(&h.app))) } else { 0.0 };
         h.app.run("select.clear", json!({})).unwrap();
-        h.app.run("appearance.assign", json!({"bodies": [part.clone()], "color": "#336699"})).unwrap();
+        // The command itself (the engine's refresh) and then the scene build.
+        let colour_command = ms(|| drop(h.app.run("appearance.assign", json!({"bodies": [part.clone()], "color": "#336699"})).unwrap()));
         let colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
         h.app.run("appearance.assign", json!({"bodies": [part.clone()], "color": "#336699", "opacity": 0.5})).unwrap();
         let opacity_class = ms(|| drop(crate::viewport::build_scene(&h.app)));
@@ -209,7 +210,7 @@ fn assembly_scene_rebuild_cost() {
             Err(_) => f64::NAN,
         };
         println!(
-            "ASSEMBLY unique={unique} placed={placed} bodies={bodies} triangles={triangles} cold_ms={cold:.1} unchanged_ms={unchanged:.1} selection_ms={selection:.1} colour_ms={colour:.1} opacity_class_ms={opacity_class:.1} component_colour_ms={component_colour:.1} theme_ms={theme:.1} hide_ms={hide:.1} geometry_ms={geometry:.1}"
+            "ASSEMBLY unique={unique} placed={placed} bodies={bodies} triangles={triangles} cold_ms={cold:.1} unchanged_ms={unchanged:.1} selection_ms={selection:.1} colour_command_ms={colour_command:.1} colour_ms={colour:.1} opacity_class_ms={opacity_class:.1} component_colour_ms={component_colour:.1} theme_ms={theme:.1} hide_ms={hide:.1} geometry_ms={geometry:.1}"
         );
     }
 }
@@ -428,4 +429,102 @@ fn whole_body_highlight_cost_from_the_models_own_triangles() {
     h.app.viewport.gpu = Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: true });
     let planned = ms(|| drop(crate::viewport::build_highlight(&h.app)));
     println!("HIGHLIGHT bodies={bodies} triangles={triangles} cpu_copy_ms={copied:.2} model_triangles_ms={planned:.2}");
+}
+
+/// A STEP file (`SOLIDCRAFT_SCALE_STEP`), opened as the app opens one (a new design and
+/// `file.insert_step`): the time of each phase of opening it, of an idle frame with its tree, of
+/// the model scene and of appearance edits on it, and of hovering its bodies on an offscreen GPU
+/// (skipped without an adapter). Run with `--ignored --nocapture`.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "manual measurement on a STEP file"]
+fn step_file_cost() {
+    let Some(path) = std::env::var_os("SOLIDCRAFT_SCALE_STEP") else { return };
+    let mut h = Harness::new();
+    let mut line = String::from("STEP");
+    let phase = |line: &mut String, name: &str, ms: f64| {
+        line.push_str(&format!(" {name}_ms={ms:.1}"));
+        eprintln!("{name}: {ms:.1} ms");
+    };
+    let import = ms(|| drop(h.app.run("file.insert_step", json!({"path": path.to_string_lossy()})).unwrap()));
+    phase(&mut line, "import", import);
+    let world = ms(|| drop(h.app.session.world_state()));
+    phase(&mut line, "world", world);
+    let mesh = ms(|| h.app.session.world_state().warm_meshes(|| true));
+    phase(&mut line, "mesh", mesh);
+    let st = h.app.session.world_state();
+    let bodies: Vec<String> = st.bodies.iter().map(|b| b.name.clone()).collect();
+    let triangles: usize = st.bodies.iter().map(|b| b.mesh().triangles.len()).sum();
+    let components = h.app.session.doc.components.len();
+    let occurrences = h.app.session.doc.occurrences.len();
+    drop(st);
+    line.push_str(&format!(" bodies={} triangles={triangles} components={components} occurrences={occurrences}", bodies.len()));
+    let first_frame = ms(|| h.frame());
+    phase(&mut line, "first_frame", first_frame);
+    let mut idle: Vec<f64> = (0..5).map(|_| ms(|| h.frame())).collect();
+    idle.sort_by(f64::total_cmp);
+    phase(&mut line, "idle_frame", idle[2]);
+    let cold = ms(|| drop(crate::viewport::build_scene(&h.app)));
+    phase(&mut line, "scene_cold", cold);
+    let unchanged = ms(|| drop(crate::viewport::build_scene(&h.app)));
+    phase(&mut line, "scene_unchanged", unchanged);
+    let Some(part) = bodies.first().cloned() else {
+        println!("{line}");
+        return;
+    };
+    let colour_command = ms(|| drop(h.app.run("appearance.assign", json!({"bodies": [&part], "color": "#336699"})).unwrap()));
+    phase(&mut line, "colour_command", colour_command);
+    let colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
+    phase(&mut line, "colour_scene", colour);
+    let opacity_command = ms(|| drop(h.app.run("appearance.assign", json!({"bodies": [&part], "color": "#336699", "opacity": 0.5})).unwrap()));
+    phase(&mut line, "opacity_command", opacity_command);
+    let opacity = ms(|| drop(crate::viewport::build_scene(&h.app)));
+    phase(&mut line, "opacity_scene", opacity);
+    let theme_name = if crate::theme::is_dark() { "light" } else { "dark" };
+    let _ = h.call("ui.prefs", json!({"theme": theme_name}));
+    let theme = ms(|| drop(crate::viewport::build_scene(&h.app)));
+    phase(&mut line, "theme_scene", theme);
+    let select = ms(|| drop(h.app.run("select.set", json!({"items": [{"type": "body", "name": &part}]})).unwrap()));
+    phase(&mut line, "select_command", select);
+    let selected_frame = ms(|| h.frame());
+    phase(&mut line, "selected_frame", selected_frame);
+    let _ = h.app.run("select.clear", json!({}));
+    const SIZE: u32 = 1024;
+    if let Some(mut frames) = crate::gpu::OffscreenFrames::new(SIZE, true) {
+        h.app.viewport.gpu =
+            Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: frames.tessellates() });
+        h.app.fit_view();
+        let model: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(crate::viewport::build_scene(&h.app))));
+        let highlight: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let gpu_cold = frames.frame(view_frame(&h.app, SIZE, (1, &model), (1, &highlight)));
+        phase(&mut line, "gpu_cold_frame", gpu_cold);
+        let mut still: Vec<f64> = (0..5).map(|_| frames.frame(view_frame(&h.app, SIZE, (1, &model), (1, &highlight)))).collect();
+        still.sort_by(f64::total_cmp);
+        phase(&mut line, "gpu_still_frame", still[2]);
+        line.push_str(&format!(" gpu_triangles={}", frames.stats().triangles));
+        let tenth = bodies.len().div_ceil(10);
+        let mut key = 1;
+        for (name, hovered) in [("hover_one", vec![part.clone()]), ("hover_tenth", bodies[..tenth].to_vec()), ("hover_all", bodies.clone())] {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                for set in [Vec::new(), hovered.clone()] {
+                    h.app.viewport.hover_bodies = set;
+                    key += 1;
+                    let built = std::time::Instant::now();
+                    *highlight.lock().unwrap() = Some(crate::viewport::build_highlight(&h.app));
+                    let build = built.elapsed().as_secs_f64() * 1000.0;
+                    let frame = frames.frame(view_frame(&h.app, SIZE, (1, &model), (key, &highlight)));
+                    if !h.app.viewport.hover_bodies.is_empty() {
+                        times.push((build + frame, build));
+                    }
+                }
+            }
+            times.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (total, build) = times[times.len() / 2];
+            phase(&mut line, name, total);
+            phase(&mut line, &format!("{name}_build"), build);
+        }
+        h.app.viewport.hover_bodies.clear();
+    }
+    println!("{line}");
 }

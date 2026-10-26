@@ -9,7 +9,7 @@
 //! the arena is capped by [`MAX_PALETTE`]. Past the cap a face falls back to its body's slot:
 //! editing such a face once rebuilds that body's block (the build still succeeds).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::gpu::{MAX_PALETTE, PaletteIndex};
 
@@ -58,7 +58,12 @@ impl PaletteArena {
     pub fn body(&mut self, name: &str, face_count: usize) -> BodySlots {
         if let Some(slots) = self.bodies.get(name).copied() {
             let grown = self.grow_faces(&slots, face_count);
-            self.bodies.insert(name.to_string(), grown);
+            // Written back only when it grew: most rebuilds find every body as it was.
+            if grown != slots
+                && let Some(kept) = self.bodies.get_mut(name)
+            {
+                *kept = grown;
+            }
             return grown;
         }
         let body = self.push();
@@ -125,11 +130,15 @@ impl PaletteArena {
     /// Drop every body when the scene belongs to a different design (no body name survives).
     /// A design that removed every body and then adds one keeps its slots (the empty set does
     /// not reset the arena).
-    pub fn sync(&mut self, names: &HashSet<String>) {
-        if names.is_empty() || self.bodies.is_empty() {
+    pub fn sync<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        if self.bodies.is_empty() {
             return;
         }
-        if !names.iter().any(|n| self.bodies.contains_key(n)) {
+        let mut names = names.into_iter().peekable();
+        if names.peek().is_none() {
+            return;
+        }
+        if !names.any(|n| self.bodies.contains_key(n)) {
             self.entries.clear();
             self.bodies.clear();
             self.generation = self.generation.wrapping_add(1);
@@ -157,12 +166,12 @@ mod tests {
         assert_ne!(grown.face(3), grown.body);
         // A new design with no shared names resets the slots.
         let generation = arena.generation();
-        arena.sync(&HashSet::from(["B".to_string()]));
+        arena.sync(["B"]);
         assert_eq!(arena.generation(), generation.wrapping_add(1));
         assert!(arena.entries().is_empty());
         // An empty scene does not reset.
         let before = arena.generation();
-        arena.sync(&HashSet::new());
+        arena.sync([]);
         assert_eq!(arena.generation(), before);
     }
 
