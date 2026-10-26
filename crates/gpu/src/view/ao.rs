@@ -6,7 +6,7 @@
 //! bits for portable integer texel reads. GLSL cannot load from a depth texture, and float
 //! colour attachments are not available on every GL adapter.
 
-use super::{Batches, TriSource, color_layout, depth_compare, far_depth, instance_layout, planned_layout, shared_layout, tri_layout};
+use super::{Batches, ClassGpu, TriSource, color_layout, depth_compare, far_depth, instance_layout, planned_layout, shared_layout, tri_layout};
 
 pub(super) struct Resources {
     pub layout: wgpu::BindGroupLayout,
@@ -116,7 +116,7 @@ impl Resources {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        uniform: &wgpu::BindGroup,
+        binds: [&wgpu::BindGroup; 2],
         radius: f32,
         size_px: [f32; 2],
         reversed: bool,
@@ -152,13 +152,32 @@ impl Resources {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_bind_group(0, uniform, &[]);
-        for batch in batches {
+        for (batch, bind) in batches.into_iter().zip(binds) {
+            pass.set_bind_group(0, bind, &[]);
             pass.set_pipeline(&self.pipeline);
             if let Some(tris) = &batch.tris {
                 for (buffer, count) in &tris.parts {
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
+                }
+            }
+            // The blocks' opaque triangles, for the same depth.
+            for key in &batch.block_order {
+                let Some(block) = batch.blocks.get(key) else { continue };
+                match &block.opaque {
+                    Some(ClassGpu::Indexed { indices, count }) => {
+                        let Some(vertices) = &block.vertices else { continue };
+                        pass.set_vertex_buffer(0, vertices.slice(..));
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    Some(ClassGpu::Unindexed(batch)) => {
+                        for (buffer, count) in &batch.parts {
+                            pass.set_vertex_buffer(0, buffer.slice(..));
+                            pass.draw(0..*count, 0..1);
+                        }
+                    }
+                    None => {}
                 }
             }
             pass.set_pipeline(&self.planned_pipeline);

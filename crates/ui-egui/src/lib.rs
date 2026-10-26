@@ -206,6 +206,7 @@ mod rule_editor;
 mod rule_editor_tests;
 pub mod save_job;
 pub mod scenario;
+pub(crate) mod scene_palette;
 pub mod select_other;
 pub mod selection;
 pub mod shell;
