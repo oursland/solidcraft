@@ -511,6 +511,11 @@ impl OffscreenFrames {
         started.elapsed().as_secs_f64() * 1000.0
     }
 
+    /// What the model scene's last change uploaded.
+    pub(crate) fn uploads(&self) -> solidcraft_gpu::view::UploadStats {
+        self.resources.get::<Renderer>().map(Renderer::uploads).unwrap_or_default()
+    }
+
     /// What the last frame drew.
     pub(crate) fn stats(&self) -> DrawStats {
         self.resources.get::<Renderer>().and_then(|r| r.stats().lock().ok().map(|s| *s)).unwrap_or_default()

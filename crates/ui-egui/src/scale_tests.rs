@@ -252,7 +252,12 @@ fn assembly_tree_hover_highlight_cost() {
 
 /// A frame of the viewport for `app`'s camera, drawing the given model and highlight scenes.
 #[cfg(not(target_arch = "wasm32"))]
-fn view_frame(app: &crate::SolveApp, size: u32, model: (u64, &crate::gpu::SceneSlot), highlight: (u64, &crate::gpu::SceneSlot)) -> crate::gpu::Frame {
+pub(crate) fn view_frame(
+    app: &crate::SolveApp,
+    size: u32,
+    model: (u64, &crate::gpu::SceneSlot),
+    highlight: (u64, &crate::gpu::SceneSlot),
+) -> crate::gpu::Frame {
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size as f32, size as f32));
     let proj = crate::viewport::projection(app, rect);
     let e = proj.cam.eye().to_f32();

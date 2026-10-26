@@ -225,6 +225,46 @@ fn an_opacity_class_change_keeps_vertices_and_rewrites_only_the_runs() {
     assert_eq!(colour.map(|c| c[3]), Some(128), "0.5 of 255");
 }
 
+/// On the GPU, a colour edit writes palette rows and no geometry, also while the body is
+/// see-through (the sorted glass stream of the no-OIT path is kept).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn appearance_edits_upload_palette_rows_only() {
+    const SIZE: u32 = 64;
+    let Some(mut frames) = crate::gpu::OffscreenFrames::new(SIZE, false) else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    app.ui.ground_shadow = false;
+    app.set_origin_shown(false);
+    app.viewport.gpu = Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+    app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
+    app.fit_view();
+    let name = app.session.world_state().bodies[0].name.clone();
+    let highlight: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut key = 0;
+    let mut draw = |app: &SolveApp| {
+        key += 1;
+        let slot: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(build_scene(app))));
+        frames.frame(crate::scale_tests::view_frame(app, SIZE, (key, &slot), (0, &highlight)));
+        frames.uploads()
+    };
+    let cold = draw(&app);
+    assert!(cold.geometry > 0 && cold.palette > 0, "the first scene uploads its geometry and palette: {cold:?}");
+    app.run("appearance.assign", json!({"bodies": [&name], "color": "#336699"})).unwrap();
+    let colour = draw(&app);
+    assert_eq!(colour.geometry, 0, "a colour edit uploads no geometry: {colour:?}");
+    assert!(colour.palette > 0, "it writes the palette: {colour:?}");
+    app.run("appearance.assign", json!({"bodies": [&name], "color": "#336699", "opacity": 0.5})).unwrap();
+    let class = draw(&app);
+    assert!(class.geometry <= 12 * 3 * crate::gpu::TRI_SIZE as u64, "a class change uploads at most the sorted glass stream: {class:?}");
+    app.run("appearance.assign", json!({"bodies": [&name], "color": "#993366", "opacity": 0.5})).unwrap();
+    let glass = draw(&app);
+    assert_eq!(glass.geometry, 0, "a see-through body's colour edit uploads no geometry: {glass:?}");
+    assert!(glass.palette > 0, "it writes the palette: {glass:?}");
+}
+
 /// Exercise the live GPU scene slots: a fresh headless render always rebuilds and would hide
 /// stale cached geometry. Theme changes must update bytes while retaining the model's mesh.
 #[test]

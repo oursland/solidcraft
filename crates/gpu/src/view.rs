@@ -174,6 +174,23 @@ pub struct DrawStats {
     pub supersampled: bool,
 }
 
+/// What the last scene change uploaded to the GPU, in bytes: what an edit costs beyond the CPU
+/// work of building the scene. Counted per scene ([`Renderer::uploads`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadStats {
+    /// Triangle vertices, index lists and lines: of the blocks and of the scene's own lists, and
+    /// the triangles shared by instanced meshes.
+    pub geometry: u64,
+    /// Placements of instanced meshes.
+    pub placements: u64,
+    /// Palette rows written.
+    pub palette: u64,
+    /// Planned bodies' per-vertex palette indices.
+    pub planned: u64,
+    /// Vertices of planned bodies evaluated again on the GPU (chunks whose plans changed).
+    pub evaluated: u64,
+}
+
 /// The renderer's last [`DrawStats`], shared with the UI that shows them.
 pub type DrawStatsHandle = Arc<Mutex<DrawStats>>;
 
@@ -1197,6 +1214,7 @@ fn class_gpu(
     runs: &Arc<Vec<std::ops::Range<u32>>>,
     old: Option<(&ClassGpu, &Arc<Vec<std::ops::Range<u32>>>)>,
     same_vertices: bool,
+    uploaded: &mut u64,
 ) -> Option<ClassGpu> {
     if runs.is_empty() {
         return None;
@@ -1208,6 +1226,7 @@ fn class_gpu(
         }
         let mut bytes = Vec::new();
         append_runs(vertices, runs, &mut bytes);
+        *uploaded += bytes.len() as u64;
         return upload(device, "sc_block_class", &bytes, TRI_SIZE).map(ClassGpu::Unindexed);
     }
     if runs.len() <= MAX_RUNS {
@@ -1217,6 +1236,7 @@ fn class_gpu(
         return Some(ClassGpu::Indexed { indices: indices.clone(), count: *count });
     }
     let bytes: Vec<u8> = runs.iter().flat_map(|r| r.clone()).flat_map(|i| i.to_le_bytes()).collect();
+    *uploaded += bytes.len() as u64;
     let count = u32::try_from(bytes.len() / 4).unwrap_or(u32::MAX);
     let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("sc_block_indices"),
@@ -1227,7 +1247,7 @@ fn class_gpu(
 }
 
 impl BlockGpu {
-    fn update(device: &wgpu::Device, old: Option<BlockGpu>, bytes: Arc<BlockBytes>) -> BlockGpu {
+    fn update(device: &wgpu::Device, old: Option<BlockGpu>, bytes: Arc<BlockBytes>, uploaded: &mut u64) -> BlockGpu {
         let fits = bytes.vertices.len() as u64 <= device.limits().max_buffer_size;
         let same_vertices = old.as_ref().is_some_and(|o| Arc::ptr_eq(&o.bytes.vertices, &bytes.vertices));
         let vertices = if !fits || bytes.vertices.is_empty() {
@@ -1235,22 +1255,27 @@ impl BlockGpu {
         } else if same_vertices {
             old.as_ref().and_then(|o| o.vertices.clone())
         } else {
+            *uploaded += bytes.vertices.len() as u64;
             Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sc_block_vertices"),
                 contents: &bytes.vertices,
                 usage: wgpu::BufferUsages::VERTEX,
             }))
         };
-        let class = |class: TriClass| {
+        let mut class = |class: TriClass| {
             let old_pair = old.as_ref().and_then(|o| o.class(class).map(|c| (c, o.bytes.runs(class))));
-            class_gpu(device, fits, &bytes.vertices, bytes.runs(class), old_pair, same_vertices)
+            class_gpu(device, fits, &bytes.vertices, bytes.runs(class), old_pair, same_vertices, uploaded)
         };
         let (opaque, glass, faded) = (class(TriClass::Opaque), class(TriClass::Glass), class(TriClass::Faded));
         let keep = |old: Option<&BlockGpu>, pick: fn(&BlockBytes) -> &Arc<Vec<u8>>, old_lines: fn(&BlockGpu) -> Option<&Batch>| {
             old.filter(|o| Arc::ptr_eq(pick(&o.bytes), pick(&bytes))).and_then(old_lines).cloned()
         };
-        let lines = keep(old.as_ref(), |b| &b.lines, |b| b.lines.as_ref()).or_else(|| upload(device, "sc_block_lines", &bytes.lines, LINE_SIZE));
-        let hidden = keep(old.as_ref(), |b| &b.hidden, |b| b.hidden.as_ref()).or_else(|| upload(device, "sc_block_hidden", &bytes.hidden, LINE_SIZE));
+        let mut fresh = |data: &[u8], label: &str| {
+            *uploaded += data.len() as u64;
+            upload(device, label, data, LINE_SIZE)
+        };
+        let lines = keep(old.as_ref(), |b| &b.lines, |b| b.lines.as_ref()).or_else(|| fresh(&bytes.lines, "sc_block_lines"));
+        let hidden = keep(old.as_ref(), |b| &b.hidden, |b| b.hidden.as_ref()).or_else(|| fresh(&bytes.hidden, "sc_block_hidden"));
         BlockGpu { bytes, vertices, opaque, glass, faded, lines, hidden }
     }
 
@@ -1349,11 +1374,19 @@ fn palette_rows(entries: &[[u8; 4]]) -> u32 {
 }
 
 impl PaletteGpu {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, uniform: &wgpu::Buffer, bgl: &wgpu::BindGroupLayout, palette: Arc<Palette>) -> PaletteGpu {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniform: &wgpu::Buffer,
+        bgl: &wgpu::BindGroupLayout,
+        palette: Arc<Palette>,
+        written: &mut u64,
+    ) -> PaletteGpu {
         let entries = palette.entries().to_vec();
         let rows = palette_rows(&entries);
         let texture = palette_texture(device, rows);
         let bytes = palette_bytes(&entries, 0, rows);
+        *written += bytes.len() as u64;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &bytes,
@@ -1374,14 +1407,22 @@ impl PaletteGpu {
 
     /// Bring the texture up to `palette`, writing only the rows whose entries changed (or the
     /// whole texture when it must grow). The bind group is rebuilt only then.
-    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, uniform: &wgpu::Buffer, bgl: &wgpu::BindGroupLayout, palette: Arc<Palette>) {
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uniform: &wgpu::Buffer,
+        bgl: &wgpu::BindGroupLayout,
+        palette: Arc<Palette>,
+        written: &mut u64,
+    ) {
         if Arc::ptr_eq(&self.palette, &palette) {
             return;
         }
         let entries = palette.entries().to_vec();
         let rows = palette_rows(&entries);
         if rows != self.rows {
-            *self = PaletteGpu::new(device, queue, uniform, bgl, palette);
+            *self = PaletteGpu::new(device, queue, uniform, bgl, palette, written);
             return;
         }
         let width = PALETTE_WIDTH as usize;
@@ -1400,6 +1441,7 @@ impl PaletteGpu {
                 row += 1;
             }
             let bytes = palette_bytes(&entries, first, row);
+            *written += bytes.len() as u64;
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self._texture,
@@ -1425,6 +1467,12 @@ const MAX_CHUNK_BODIES: usize = 128;
 
 #[derive(Default)]
 struct Batches {
+    /// What the last scene taken uploaded.
+    uploads: UploadStats,
+    /// The blocks' see-through triangles the global glass stream was assembled from (block key,
+    /// vertices and glass runs, by address), when it holds nothing else: an edit that changes
+    /// neither leaves the sorted stream as it is.
+    glass_from: Option<Vec<(u64, usize, usize)>>,
     /// The scene's palette texture and its group 0 bind (uniform + palette).
     palette: Option<PaletteGpu>,
     /// The scene blocks on the GPU, by key, and their drawing order.
@@ -1486,14 +1534,17 @@ impl Batches {
             return;
         }
         if let Some(sc) = slot.lock().ok().and_then(|mut s| s.take()) {
+            self.uploads = UploadStats::default();
             let palette = sc.palette.clone();
+            let mut written = 0;
             match self.palette.take() {
                 Some(mut p) => {
-                    p.update(device, queue, uniform, bgl, palette);
+                    p.update(device, queue, uniform, bgl, palette, &mut written);
                     self.palette = Some(p);
                 }
-                None => self.palette = Some(PaletteGpu::new(device, queue, uniform, bgl, palette)),
+                None => self.palette = Some(PaletteGpu::new(device, queue, uniform, bgl, palette, &mut written)),
             }
+            self.uploads.palette = written;
             self.planned = match tess {
                 Some((tess, encoder)) => self.planned(device, tess, encoder, &sc.planned),
                 None => Vec::new(),
@@ -1508,37 +1559,60 @@ impl Batches {
             self.selected_instanced = self.instanced(device, &sc.selected_instanced);
             let mut kept = std::mem::take(&mut self.blocks);
             let mut order = Vec::with_capacity(sc.blocks.len());
+            let mut geometry = 0;
             for block in &sc.blocks {
                 let old = kept.remove(&block.key);
-                self.blocks.insert(block.key, BlockGpu::update(device, old, block.bytes.clone()));
+                self.blocks.insert(block.key, BlockGpu::update(device, old, block.bytes.clone(), &mut geometry));
                 order.push(block.key);
             }
-            let blocks: Vec<&BlockGpu> = order.iter().filter_map(|k| self.blocks.get(k)).collect();
             self.block_order = order;
-            self.tris = upload(device, "sc_tris", &sc.tris, TRI_SIZE);
-            self.pbr = upload(device, "sc_pbr", &sc.pbr, PBR_SIZE);
-            self.trans = upload(device, "sc_trans", &sc.trans, TRI_SIZE);
-            self.shadow = upload(device, "sc_shadow", &sc.shadow, TRI_SIZE);
+            let mut own = |label: &str, data: &[u8], stride: usize| {
+                geometry += data.len() as u64;
+                upload(device, label, data, stride)
+            };
+            self.tris = own("sc_tris", &sc.tris, TRI_SIZE);
+            self.pbr = own("sc_pbr", &sc.pbr, PBR_SIZE);
+            self.trans = own("sc_trans", &sc.trans, TRI_SIZE);
+            self.shadow = own("sc_shadow", &sc.shadow, TRI_SIZE);
+            let own_lines = own("sc_lines", &sc.lines, LINE_SIZE);
+            let own_hidden = own("sc_hidden", &sc.hidden, LINE_SIZE);
+            self.overlays = own("sc_overlay", &sc.overlay, LINE_SIZE);
+            self.ghost = own("sc_ghost", &sc.ghost, TRI_SIZE);
+            self.xray = own("sc_xray", &sc.xray, TRI_SIZE);
+            self.under = own("sc_under", &sc.under, LINE_SIZE);
+            self.guide_trans = own("sc_guide_trans", &sc.guide_trans, TRI_SIZE);
+            self.guide_lines = own("sc_guide_lines", &sc.guide_lines, LINE_SIZE);
+            let blocks: Vec<&BlockGpu> = self.block_order.iter().filter_map(|k| self.blocks.get(k)).collect();
+            self.lines = joined(blocks.iter().map(|b| &b.lines), own_lines);
+            self.hidden = joined(blocks.iter().map(|b| &b.hidden), own_hidden);
             // Without order-independent transparency one global glass stream is sorted per view,
             // so cross-body blend order is kept; the blocks' glass triangles join it here. With
-            // OIT the blocks draw their own index lists and nothing is sorted.
-            self.glass_cpu.clear();
-            self.glass_cpu.extend_from_slice(&sc.glass);
-            if !oit_available {
-                for block in &sc.blocks {
-                    append_runs(&block.bytes.vertices, &block.bytes.glass, &mut self.glass_cpu);
+            // OIT the blocks draw their own runs and nothing is sorted. A stream made of the same
+            // blocks' glass as before (a colour or opacity edit, a selection) is kept as sorted.
+            let from: Vec<(u64, usize, usize)> = if oit_available {
+                Vec::new()
+            } else {
+                sc.blocks
+                    .iter()
+                    .filter(|b| !b.bytes.glass.is_empty())
+                    .map(|b| (b.key, Arc::as_ptr(&b.bytes.vertices) as usize, Arc::as_ptr(&b.bytes.glass) as usize))
+                    .collect()
+            };
+            let same_glass = sc.glass.is_empty() && self.glass_from.as_ref() == Some(&from);
+            if !same_glass {
+                self.glass_cpu.clear();
+                self.glass_cpu.extend_from_slice(&sc.glass);
+                if !oit_available {
+                    for block in &sc.blocks {
+                        append_runs(&block.bytes.vertices, &block.bytes.glass, &mut self.glass_cpu);
+                    }
                 }
+                geometry += self.glass_cpu.len() as u64;
+                self.glass = upload_with(device, "sc_glass", &self.glass_cpu, TRI_SIZE, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
+                self.glass_sorted_for = None;
+                self.glass_from = sc.glass.is_empty().then_some(from);
             }
-            self.glass = upload_with(device, "sc_glass", &self.glass_cpu, TRI_SIZE, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
-            self.glass_sorted_for = None;
-            self.lines = joined(blocks.iter().map(|b| &b.lines), upload(device, "sc_lines", &sc.lines, LINE_SIZE));
-            self.hidden = joined(blocks.iter().map(|b| &b.hidden), upload(device, "sc_hidden", &sc.hidden, LINE_SIZE));
-            self.overlays = upload(device, "sc_overlay", &sc.overlay, LINE_SIZE);
-            self.ghost = upload(device, "sc_ghost", &sc.ghost, TRI_SIZE);
-            self.xray = upload(device, "sc_xray", &sc.xray, TRI_SIZE);
-            self.under = upload(device, "sc_under", &sc.under, LINE_SIZE);
-            self.guide_trans = upload(device, "sc_guide_trans", &sc.guide_trans, TRI_SIZE);
-            self.guide_lines = upload(device, "sc_guide_lines", &sc.guide_lines, LINE_SIZE);
+            self.uploads.geometry += geometry;
             self.key = Some(key);
         }
     }
@@ -1560,7 +1634,10 @@ impl Batches {
                 let gpu = match kept.remove(&key).or_else(|| self.instanced_tris.remove(&key)).filter(|(b, _)| Arc::ptr_eq(b, tris)) {
                     Some(t) => t,
                     None => match SharedGpu::new(device, tris) {
-                        Some(g) => (tris.clone(), Arc::new(g)),
+                        Some(g) => {
+                            self.uploads.geometry += (tris.vertices.len() + tris.indices.len() * 4) as u64;
+                            (tris.clone(), Arc::new(g))
+                        }
                         None => continue,
                     },
                 };
@@ -1570,6 +1647,7 @@ impl Batches {
                     contents: &placements,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
+                self.uploads.placements += placements.len() as u64;
                 let count = if i == 0 { count } else { 0 };
                 levels.push(LevelDraw { tris: gpu.1.clone(), flat: tris.flat, error, instances, count });
                 self.instanced_tris.insert(key, gpu);
@@ -1679,6 +1757,7 @@ impl Batches {
                     let plans: Vec<&solidcraft_geom::tess::TessPlan> = chunk.iter().map(|b| &*b.plan).collect();
                     match tess.prepare_many(&plans) {
                         Ok(m) => {
+                            self.uploads.evaluated += plans.iter().map(|p| p.vertex_count() as u64).sum::<u64>();
                             tess.record(encoder, &m);
                             let m = Arc::new(m);
                             self.resident.insert(key(chunk), (chunk.iter().map(|b| b.plan.clone()).collect(), m.clone()));
@@ -1699,6 +1778,7 @@ impl Batches {
                     bytes.extend_from_slice(&b.face_colors.get(*f as usize).copied().unwrap_or(last).0.to_le_bytes());
                 }
             }
+            self.uploads.planned += bytes.len() as u64;
             if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
                 out.push(PlannedDraw { mesh, colors, plans: key(chunk) });
             }
@@ -2925,6 +3005,11 @@ impl Renderer {
         self.stats.clone()
     }
 
+    /// What the model scene's last change uploaded ([`UploadStats`]).
+    pub fn uploads(&self) -> UploadStats {
+        self.model.uploads
+    }
+
     fn publish(&self, drawn: DrawStats) {
         if let Ok(mut s) = self.stats.lock() {
             *s = drawn;
@@ -3792,6 +3877,42 @@ mod glass_tests {
         let scene = 524_434_680usize;
         assert_eq!(scene.div_ceil(buffer_chunk(TRI_SIZE, limit)), 2);
         assert!(buffer_chunk(TRI_SIZE, 1) >= TRI_SIZE * 6, "a tiny limit still holds one unit");
+    }
+
+    /// Without order-independent transparency, the sorted glass stream is kept while the blocks'
+    /// see-through triangles stay the same: a colour edit (a new palette) uploads palette rows
+    /// and no geometry; a class change rebuilds the stream.
+    #[test]
+    fn a_colour_edit_keeps_the_sorted_glass_stream() {
+        let Ok((_, device, queue)) = crate::open_headless() else { return };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(crate::depth_format(&device, true)), samples: 1, tess: false }, None);
+        let mut palette = Palette::with_stable(vec![[200, 0, 0, 128]]);
+        let mut b = BlockBuilder::default();
+        b.triangle([[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0]; 3], PaletteIndex(0), TriClass::Glass);
+        let bytes = b.freeze();
+        let scene = |palette: &Palette, bytes: &Arc<BlockBytes>| GpuScene {
+            palette: Arc::new(palette.clone()),
+            blocks: vec![SceneBlock { key: 7, bytes: bytes.clone() }],
+            ..GpuScene::default()
+        };
+        let take = |r: &mut Renderer, key: u64, sc: GpuScene| {
+            let slot: SceneSlot = Arc::new(Mutex::new(Some(sc)));
+            r.model.take(&device, &queue, &r.uniform, &r.uniform_bgl, key, &slot, None, false);
+            r.model.uploads
+        };
+        let first = take(&mut r, 1, scene(&palette, &bytes));
+        assert_eq!(first.geometry, (2 * 3 * TRI_SIZE) as u64, "the block's vertices and the sorted stream: {first:?}");
+        palette.set(PaletteIndex(0), [0, 0, 200, 128]);
+        let colour = take(&mut r, 2, scene(&palette, &bytes));
+        assert_eq!(colour.geometry, 0, "a colour edit keeps the stream: {colour:?}");
+        assert!(colour.palette > 0, "and writes the palette: {colour:?}");
+        let mut b = BlockBuilder::default();
+        b.triangle([[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0]; 3], PaletteIndex(0), TriClass::Opaque);
+        let opaque = take(&mut r, 3, scene(&palette, &b.freeze()));
+        assert!(opaque.geometry > 0, "new block geometry is uploaded: {opaque:?}");
+        let back = take(&mut r, 4, scene(&palette, &bytes));
+        assert!(back.geometry >= (3 * TRI_SIZE) as u64, "the stream is rebuilt when the see-through set changes: {back:?}");
     }
 
     /// The middle pixel of `scene` drawn looking down -Z (x, y in -10..10) into a 64 × 64 frame,
