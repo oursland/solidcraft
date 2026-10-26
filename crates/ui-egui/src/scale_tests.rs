@@ -71,6 +71,46 @@ fn frame_and_cheap_command_cost_by_body_count() {
     }
 }
 
+/// Times the model scene build after the edits that used to rebuild and upload everything:
+/// selection (a revision bump with no model change), an appearance colour and an opacity class
+/// change, a theme switch, and one body's geometry edit. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "manual palette measurement"]
+fn appearance_and_selection_rebuild_cost() {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    for n in [200usize, 1000, 5000] {
+        let mut h = grid(n);
+        h.app.session.world_state().warm_meshes(|| true);
+        h.frames(2);
+        let body = h.app.session.world_state().bodies[0].name.clone();
+        let cold = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let again = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let proj = crate::viewport::projection(&h.app, rect);
+        let key = crate::viewport::display_scene_keys(&h.app, &proj).0;
+        h.app.run("select.set", json!({"items":[{"type":"body","name":body}]})).unwrap();
+        let selection_key_changed = crate::viewport::display_scene_keys(&h.app, &proj).0 != key;
+        let selection = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("select.clear", json!({})).unwrap();
+        h.app.run("appearance.assign", json!({"bodies":[body.clone()],"color":"#336699"})).unwrap();
+        let colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("appearance.assign", json!({"bodies":[body.clone()],"color":"#336699","opacity":0.5})).unwrap();
+        let opacity_class = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let theme_name = if crate::theme::is_dark() { "light" } else { "dark" };
+        let _ = h.call("ui.prefs", json!({"theme": theme_name}));
+        let theme = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let geometry = match h.app.run("solid.move", json!({"bodies":[body.clone()], "translate":[1.0, 0.0, 0.0]})) {
+            Ok(_) => ms(|| drop(crate::viewport::build_scene(&h.app))),
+            Err(e) => {
+                println!("MEASURE n={n} geometry edit refused: {e}");
+                f64::NAN
+            }
+        };
+        println!(
+            "MEASURE n={n} cold_ms={cold:.1} unchanged_ms={again:.1} selection_ms={selection:.1} selection_rebuilds={selection_key_changed} colour_ms={colour:.1} opacity_class_ms={opacity_class:.1} theme_ms={theme:.1} geometry_ms={geometry:.1}"
+        );
+    }
+}
+
 /// A design from a file (`SOLIDCRAFT_SCALE_DESIGN`), every browser folder open: the time of an
 /// idle frame and of the cheap commands, as [`frame_and_cheap_command_cost_by_body_count`].
 #[test]
