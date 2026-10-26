@@ -111,6 +111,37 @@ fn appearance_and_selection_rebuild_cost() {
     }
 }
 
+/// The same edits on a design of few, large meshes: the case where rebuilding a block rebuilt and
+/// re-uploaded a large part of the model. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "manual palette measurement"]
+fn large_body_scene_rebuild_cost() {
+    for n in [20usize, 100] {
+        let mut h = Harness::new();
+        for k in 0..n {
+            h.app
+                .run("solid.torus", json!({"major": 100, "minor": 10, "center": [k as f64 * 220.0, 0.0, 0.0], "body_name": format!("T{k}")}))
+                .unwrap();
+        }
+        h.app.session.world_state().warm_meshes(|| true);
+        h.frames(2);
+        let bodies = h.app.session.world_state().bodies.len();
+        let triangles: usize = h.app.session.world_state().bodies.iter().map(|b| b.mesh().triangles.len()).sum();
+        let body = h.app.session.world_state().bodies[0].name.clone();
+        let cold = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("appearance.assign", json!({"bodies":[body.clone()],"color":"#336699"})).unwrap();
+        let colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("appearance.assign", json!({"bodies":[body.clone()],"color":"#336699","opacity":0.5})).unwrap();
+        let opacity_class = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let theme_name = if crate::theme::is_dark() { "light" } else { "dark" };
+        let _ = h.call("ui.prefs", json!({"theme": theme_name}));
+        let theme = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        println!(
+            "LARGE n={n} bodies={bodies} triangles={triangles} cold_ms={cold:.1} colour_ms={colour:.1} opacity_class_ms={opacity_class:.1} theme_ms={theme:.1}"
+        );
+    }
+}
+
 /// A design from a file (`SOLIDCRAFT_SCALE_DESIGN`), every browser folder open: the time of an
 /// idle frame and of the cheap commands, as [`frame_and_cheap_command_cost_by_body_count`].
 #[test]
