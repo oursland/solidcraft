@@ -142,6 +142,78 @@ fn large_body_scene_rebuild_cost() {
     }
 }
 
+/// An assembly: `unique` detailed parts (a patterned torus, ~8,400 triangles each) and one
+/// detailed component placed `placed` times (drawn as instances). Settled, with warm meshes.
+fn assembly(unique: usize, placed: usize) -> Harness {
+    let mut h = Harness::new();
+    let per = |n: usize| (n as f64).sqrt().ceil().max(1.0) as usize;
+    h.app.run("solid.torus", json!({"major": 40, "minor": 6, "center": [0, 0, 0], "body_name": "Part"})).unwrap();
+    let (c1, c2) = (per(unique), unique.div_ceil(per(unique)));
+    h.app
+        .run(
+            "solid.pattern.rectangular",
+            json!({"bodies": ["Part"], "dir1": [1, 0, 0], "count1": c1, "spacing1": 100, "dir2": [0, 1, 0], "count2": c2, "spacing2": 100}),
+        )
+        .unwrap();
+    h.app.run("solid.torus", json!({"major": 40, "minor": 6, "center": [0, 0, -200], "body_name": "Wheel"})).unwrap();
+    h.app.run("component.from_bodies", json!({"bodies": ["Wheel"]})).unwrap();
+    let (p1, p2) = (per(placed), placed.div_ceil(per(placed)));
+    h.app
+        .run(
+            "solid.pattern.rectangular",
+            json!({"components": ["Wheel"], "dir1": [1, 0, 0], "count1": p1, "spacing1": 100, "dir2": [0, 1, 0], "count2": p2, "spacing2": 100}),
+        )
+        .unwrap();
+    h.app.session.world_state().warm_meshes(|| true);
+    h.frames(3);
+    h
+}
+
+/// The edits made on an assembly, timed on the model scene build: selection, a part's colour and
+/// opacity, a component's colour (every placement), a theme switch, hiding a part, and moving one
+/// part. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "manual palette measurement"]
+fn assembly_scene_rebuild_cost() {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+    for (unique, placed) in [(100, 100), (300, 500)] {
+        let mut h = assembly(unique, placed);
+        let st = h.app.session.world_state();
+        let bodies = st.bodies.len();
+        let triangles: usize = st.bodies.iter().map(|b| b.mesh().triangles.len()).sum();
+        let part = st.bodies.iter().find(|b| b.component == 0).map(|b| b.name.clone()).unwrap();
+        drop(st);
+        let cold = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let unchanged = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let proj = crate::viewport::projection(&h.app, rect);
+        let key = crate::viewport::display_scene_keys(&h.app, &proj).0;
+        h.app.run("select.set", json!({"items": [{"type": "body", "name": part}]})).unwrap();
+        let selection_rebuilds = crate::viewport::display_scene_keys(&h.app, &proj).0 != key;
+        let selection = if selection_rebuilds { ms(|| drop(crate::viewport::build_scene(&h.app))) } else { 0.0 };
+        h.app.run("select.clear", json!({})).unwrap();
+        h.app.run("appearance.assign", json!({"bodies": [part.clone()], "color": "#336699"})).unwrap();
+        let colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("appearance.assign", json!({"bodies": [part.clone()], "color": "#336699", "opacity": 0.5})).unwrap();
+        let opacity_class = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("appearance.assign", json!({"components": ["Wheel"], "color": "#cc6633"})).unwrap();
+        let component_colour = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        let theme_name = if crate::theme::is_dark() { "light" } else { "dark" };
+        let _ = h.call("ui.prefs", json!({"theme": theme_name}));
+        let theme = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("browser.visibility", json!({"visible": false, "items": [part.clone()]})).unwrap();
+        let hide = ms(|| drop(crate::viewport::build_scene(&h.app)));
+        h.app.run("browser.visibility", json!({"visible": true, "items": [part.clone()]})).unwrap();
+        let _ = crate::viewport::build_scene(&h.app);
+        let geometry = match h.app.run("solid.move", json!({"bodies": [part.clone()], "translate": [1.0, 0.0, 0.0]})) {
+            Ok(_) => ms(|| drop(crate::viewport::build_scene(&h.app))),
+            Err(_) => f64::NAN,
+        };
+        println!(
+            "ASSEMBLY unique={unique} placed={placed} bodies={bodies} triangles={triangles} cold_ms={cold:.1} unchanged_ms={unchanged:.1} selection_ms={selection:.1} colour_ms={colour:.1} opacity_class_ms={opacity_class:.1} component_colour_ms={component_colour:.1} theme_ms={theme:.1} hide_ms={hide:.1} geometry_ms={geometry:.1}"
+        );
+    }
+}
+
 /// A design from a file (`SOLIDCRAFT_SCALE_DESIGN`), every browser folder open: the time of an
 /// idle frame and of the cheap commands, as [`frame_and_cheap_command_cost_by_body_count`].
 #[test]
