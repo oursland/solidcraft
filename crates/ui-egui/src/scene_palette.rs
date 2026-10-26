@@ -105,6 +105,11 @@ impl PaletteArena {
         PaletteIndex(i)
     }
 
+    /// The slots of `name`, if it has any (nothing is allocated).
+    pub fn slots(&self, name: &str) -> Option<BodySlots> {
+        self.bodies.get(name).copied()
+    }
+
     /// The colour at `slot`, if it is allocated.
     pub fn get(&self, slot: PaletteIndex) -> Option<[u8; 4]> {
         self.entries.get(slot.0 as usize).copied()

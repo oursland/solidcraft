@@ -471,6 +471,10 @@ pub struct GpuScene {
     pub hover_blocks: Vec<BlockTris>,
     /// Whole selected bodies, as `hover_blocks`, in the selection colour.
     pub selected_blocks: Vec<BlockTris>,
+    /// Whole highlighted bodies the model builds in its blocks but does not draw opaque (faded
+    /// context, see-through): every one of their vertices drawn again, in this scene's palette,
+    /// whose entries for their faces hold the highlight colour. No triangle is copied.
+    pub recoloured: Vec<BlockTris>,
     /// Whole hovered bodies the model draws as placements of shared triangles: those meshes with
     /// the body's highlight colour on each placement.
     pub hover_instanced: Vec<InstancedMesh>,
@@ -1451,6 +1455,8 @@ struct Batches {
     /// Whole highlighted bodies redrawn from the scene's blocks, by block key and vertex range.
     hover_blocks: Vec<BlockTris>,
     selected_blocks: Vec<BlockTris>,
+    /// Whole faded or see-through bodies redrawn from the model's blocks in this scene's palette.
+    recoloured: Vec<BlockTris>,
     /// Whole highlighted bodies drawn as placements of the scene's shared triangles.
     hover_instanced: Vec<InstancedDraw>,
     selected_instanced: Vec<InstancedDraw>,
@@ -1497,6 +1503,7 @@ impl Batches {
             self.selected_planned = sc.selected_planned;
             self.hover_blocks = sc.hover_blocks;
             self.selected_blocks = sc.selected_blocks;
+            self.recoloured = sc.recoloured;
             self.hover_instanced = self.instanced(device, &sc.hover_instanced);
             self.selected_instanced = self.instanced(device, &sc.selected_instanced);
             let mut kept = std::mem::take(&mut self.blocks);
@@ -3090,6 +3097,23 @@ impl Renderer {
         pass.set_bind_group(0, scene_bind(h, &res.bind), &[]);
         tinted_instanced(pass, &res.tri_hl_instanced, &res.tri_hl_instanced_flat, &h.hover_instanced);
         tinted_instanced(pass, &res.tri_hl_instanced, &res.tri_hl_instanced_flat, &h.selected_instanced);
+        // Whole faded or see-through bodies: the model's block vertices, in this palette.
+        for r in &h.recoloured {
+            let Some(block) = m.blocks.get(&r.block) else { continue };
+            let Some(vertices) = &block.vertices else { continue };
+            pass.set_pipeline(&res.tri_hl);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.draw(r.vertices.clone(), 0..1);
+            tally.triangles(r.vertices.len() as u32, 1);
+        }
+        // The highlight's own feedback triangles: its blocks' (kept while it is unchanged), then
+        // the loose ones.
+        for key in &h.block_order {
+            if let Some(block) = h.blocks.get(key).filter(|b| b.class(TriClass::Opaque).is_some()) {
+                pass.set_pipeline(&res.tri_hl);
+                block.draw(pass, TriClass::Opaque, tally);
+            }
+        }
         tris(pass, &res.tri_hl, &h.tris);
         pass.set_bind_group(0, scene_bind(m, &res.bind), &[]);
         lines(pass, &res.line, &m.lines);

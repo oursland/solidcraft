@@ -1325,7 +1325,7 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     let mut body_tris = std::collections::HashMap::new();
     for (key, c) in &made {
         for range in &c.ranges {
-            if !range.opaque.is_empty() {
+            if !range.vertices.is_empty() {
                 body_tris
                     .insert(range.name.clone(), crate::gpu::BlockTris { block: *key, tris: range.opaque.clone(), vertices: range.vertices.clone() });
             }
@@ -2974,6 +2974,8 @@ struct HoverBlock {
     /// highlight colour.
     hover_instanced: Vec<crate::gpu::InstancedMesh>,
     selected_instanced: Vec<crate::gpu::InstancedMesh>,
+    /// Faded or see-through bodies in the model's blocks, drawn again in this palette.
+    recoloured: Vec<crate::gpu::BlockTris>,
 }
 
 /// The plan the model draws a whole highlighted body from, when it draws one on the GPU. The
@@ -3013,15 +3015,11 @@ struct HighlightInstances {
 impl HighlightInstances {
     /// Add the body at `color`, when the model draws it as an instanced placement of an opaque
     /// shared mesh; `false` when it does not (the caller builds its feedback on the CPU).
-    fn add(
-        &mut self,
-        app: &SolveApp,
-        b: &solidcraft_engine::doc::ModelBody,
-        active_bodies: &Option<Vec<String>>,
-        color: crate::gpu::PaletteIndex,
-    ) -> bool {
-        // A body with face appearances of its own is built on the CPU, never as an instance.
-        if !highlight_opaque(app, b, active_bodies) || !app.session.doc.face_colors(b).is_empty() {
+    fn add(&mut self, app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, color: crate::gpu::PaletteIndex) -> bool {
+        // A live preview stands in for the body; a body with face appearances of its own is built
+        // on the CPU, never as an instance. A faded or see-through placement is lit like an opaque
+        // one: the highlight colour is the placement's own here, not the model's.
+        if app.preview.effective_replaced().contains(&b.name) || !app.session.doc.face_colors(b).is_empty() {
             return false;
         }
         let Some((mesh, m)) = shared_mesh(app, b) else { return false };
@@ -3078,11 +3076,72 @@ fn highlight_block_tris(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -
     map.get(&b.name).cloned()
 }
 
+/// How a whole body is lit: hovered or selected, and in which colour (where the model's own
+/// colour is not kept: placements, and faded or see-through bodies).
+#[derive(Clone, Copy)]
+struct WholeBody {
+    selected: bool,
+    colour: [u8; 4],
+}
+
+/// Light the whole of `b` from what the model already has on the GPU, copying no triangle: its
+/// plan or its opaque runs (tinted over the model's own colours), its block's vertices recoloured
+/// in the highlight's palette (faded and see-through bodies), or its placements. `false` when
+/// none applies (wireframe, a live preview standing in for the body): the caller copies it.
+fn light_whole_body(
+    app: &SolveApp,
+    b: &solidcraft_engine::doc::ModelBody,
+    active_bodies: &Option<Vec<String>>,
+    lit: WholeBody,
+    body_slots: &crate::scene_palette::PaletteArena,
+    feedback: &mut GpuScene,
+    instances: &mut HighlightInstances,
+) -> bool {
+    if let Some(plan) = highlight_plan(app, b, active_bodies) {
+        if lit.selected {
+            feedback.selected_planned.push(plan)
+        } else {
+            feedback.hover_planned.push(plan)
+        }
+        return true;
+    }
+    let opaque = highlight_opaque(app, b, active_bodies);
+    if let Some(tris) = highlight_block_tris(app, b) {
+        if opaque && !tris.tris.is_empty() {
+            if lit.selected {
+                feedback.selected_blocks.push(tris)
+            } else {
+                feedback.hover_blocks.push(tris)
+            }
+            return true;
+        }
+        // Faded or see-through: the body's every vertex again, its slots in this palette holding
+        // the highlight colour (as the copy it replaces was drawn).
+        if !opaque && let Some(slots) = body_slots.slots(&b.name) {
+            let palette = std::sync::Arc::make_mut(&mut feedback.palette);
+            palette.set(slots.body, lit.colour);
+            for f in 0..b.body.face_count() {
+                palette.set(slots.face(f), lit.colour);
+            }
+            feedback.recoloured.push(tris);
+            return true;
+        }
+    }
+    let colour = feedback.color(lit.colour);
+    instances.add(app, b, colour)
+}
+
 /// The highlight scene: origin widget, construction planes, selection and hover.
 pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     let began = crate::now_ms();
     let t = Tokens::get();
-    let mut sc = GpuScene::default();
+    // The model scene's stable palette slots first: whole faded or see-through bodies are drawn
+    // again from the model's own vertices in this palette, their slots set to the highlight's
+    // colour (see `light_whole_body`); this scene's own colours follow.
+    // The key first: it reads the arena (`scene_key`), which is held below.
+    let key = highlight_geometry_key(app);
+    let body_slots = app.viewport.palette.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sc = GpuScene::with_palette(crate::gpu::Palette::with_stable(body_slots.entries()));
     let st = crate::open_meshing::shown_world(app);
     let s = &app.session;
     let active_bodies = s.active_occurrence_path.as_ref().and_then(|p| s.occurrence_bodies(p, true).ok());
@@ -3182,7 +3241,6 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     // Reference widgets follow zoom; the often much larger world-space feedback does not.
     let projected = sel.iter().any(|s| matches!(s, Sel::Profile { .. } | Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. }))
         || matches!(hover, Some(Hit::Profile { .. }));
-    let key = highlight_geometry_key(app);
     if !projected
         && let Some(cached) = app.viewport.hover_block.lock().ok().and_then(|cache| {
             cache.as_ref().filter(|c| c.key == key && std::sync::Arc::ptr_eq(&c.state, &st) && std::sync::Arc::ptr_eq(&c.doc, &s.doc)).cloned()
@@ -3194,6 +3252,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         sc.selected_planned = cached.selected_planned;
         sc.hover_blocks = cached.hover_blocks;
         sc.selected_blocks = cached.selected_blocks;
+        sc.recoloured = cached.recoloured;
         sc.hover_instanced = cached.hover_instanced;
         sc.selected_instanced = cached.selected_instanced;
         return sc;
@@ -3215,11 +3274,8 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
                 if let Some(b) = st.body(name)
                     && app.session.body_visible(name)
                 {
-                    if let Some(plan) = highlight_plan(app, b, &active_bodies) {
-                        feedback.selected_planned.push(plan);
-                    } else if let Some(tris) = highlight_block_tris(app, b) {
-                        feedback.selected_blocks.push(tris);
-                    } else if !selected_instances.add(app, b, &active_bodies, feedback.color(c4(t.body_selected))) {
+                    let lit = WholeBody { selected: true, colour: c4(t.body_selected) };
+                    if !light_whole_body(app, b, &active_bodies, lit, &body_slots, &mut feedback, &mut selected_instances) {
                         let m = shown(b);
                         let count = b.body.face_count();
                         mesh_tris(&mut feedback, &m, c4(t.body_selected), true, |f| (f as usize) < count);
@@ -3319,12 +3375,9 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         if !selected_body {
             // A whole body the model draws from a plan is lit by redrawing the plan's own
             // evaluated triangles, not by building every triangle again (see `highlight_plan`).
-            if whole && let Some(plan) = highlight_plan(app, b, &active_bodies) {
-                feedback.hover_planned.push(plan);
-            } else if whole && let Some(tris) = highlight_block_tris(app, b) {
-                feedback.hover_blocks.push(tris);
-            } else if whole && hover_instances.add(app, b, &active_bodies, feedback.color(hover_col)) {
-                // Its placements carry the highlight colour.
+            let lit = WholeBody { selected: false, colour: hover_col };
+            if whole && light_whole_body(app, b, &active_bodies, lit, &body_slots, &mut feedback, &mut hover_instances) {
+                // Drawn again from what the model already has on the GPU.
             } else {
                 let lit = shown(b);
                 let selected_faces = selected_faces.get(b.name.as_str());
@@ -3350,11 +3403,8 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
                 let k = t.hover_face_lift;
                 let c = body_color(&s.doc, b).unwrap_or(t.body);
                 let hover_col = [c.r().saturating_add(k), c.g().saturating_add(k), c.b().saturating_add(k), 255];
-                if let Some(plan) = highlight_plan(app, b, &active_bodies) {
-                    feedback.hover_planned.push(plan);
-                } else if let Some(tris) = highlight_block_tris(app, b) {
-                    feedback.hover_blocks.push(tris);
-                } else if !hover_instances.add(app, b, &active_bodies, feedback.color(hover_col)) {
+                let lit = WholeBody { selected: false, colour: hover_col };
+                if !light_whole_body(app, b, &active_bodies, lit, &body_slots, &mut feedback, &mut hover_instances) {
                     let m = shown(b);
                     let count = b.body.face_count();
                     mesh_tris(&mut feedback, &m, hover_col, true, |f| (f as usize) < count);
@@ -3417,6 +3467,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         sc.selected_planned.append(&mut feedback.selected_planned);
         sc.hover_blocks.append(&mut feedback.hover_blocks);
         sc.selected_blocks.append(&mut feedback.selected_blocks);
+        sc.recoloured.append(&mut feedback.recoloured);
         sc.hover_instanced.append(&mut feedback.hover_instanced);
         sc.selected_instanced.append(&mut feedback.selected_instanced);
     } else {
@@ -3437,6 +3488,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         let (hover_planned, selected_planned) = (feedback.hover_planned, feedback.selected_planned);
         let (hover_blocks, selected_blocks) = (feedback.hover_blocks, feedback.selected_blocks);
         let (hover_instanced, selected_instanced) = (feedback.hover_instanced, feedback.selected_instanced);
+        let recoloured = feedback.recoloured;
         if let Ok(mut cache) = app.viewport.hover_block.lock() {
             *cache = Some(HoverBlock {
                 key,
@@ -3450,6 +3502,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
                 selected_blocks: selected_blocks.clone(),
                 hover_instanced: hover_instanced.clone(),
                 selected_instanced: selected_instanced.clone(),
+                recoloured: recoloured.clone(),
             });
         }
         sc.blocks.push(block);
@@ -3459,6 +3512,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
         sc.selected_blocks = selected_blocks;
         sc.hover_instanced = hover_instanced;
         sc.selected_instanced = selected_instanced;
+        sc.recoloured = recoloured;
     }
 
     if solidcraft_engine::geom::env::var_os("PROFILE_FRAMES").is_some() {
@@ -6119,6 +6173,53 @@ mod tests {
         if saved { format!("pictures in {}", dir.display()) } else { format!("the pictures could not be saved in {}", dir.display()) }
     }
 
+    /// The highlight scene as the viewport hands it over keeps its feedback (a hovered face, a
+    /// body copied on the CPU) in a block of its own, kept while the highlight is unchanged. That
+    /// block is drawn: the picture is the same as with the feedback merged into the scene's own
+    /// triangles. Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_highlight_scenes_own_block_is_drawn() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20, "corner": [0, 0, 0], "operation": "new"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.fit_view();
+        const SIZE: u32 = 128;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let body = app.session.world_state().bodies[0].clone();
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+        let model = build_scene(&app);
+        let render = |highlight: GpuScene| {
+            crate::gpu::render_offscreen(
+                model.clone(),
+                Some(highlight),
+                proj.vp.to_f32(),
+                proj.cam.back().to_f32(),
+                eye,
+                SIZE,
+                None,
+                [0.0; 8],
+                crate::gpu::analysis_colors(&Tokens::get().analysis),
+            )
+        };
+        let Some(plain) = render(GpuScene::default()) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut lit = 0;
+        for index in 0..body.body.face_count() {
+            app.viewport.hover = Some(Hit::Face { body: body.name.clone(), index, point: Vec3::ZERO });
+            let highlight = build_highlight(&app);
+            assert!(highlight.blocks.iter().any(|b| !b.bytes.vertices.is_empty()), "the face's feedback is in the highlight's block");
+            let (Some(as_handed), Some(merged)) = (render(highlight.clone()), render(highlight.merged())) else { return };
+            assert!(as_handed == merged, "face {index}: the highlight's block is not drawn as its merged triangles are");
+            lit += usize::from(as_handed != plain);
+        }
+        assert!(lit >= 3, "{lit} faces light up");
+    }
+
     /// An origin plane lying on a body's face is tinted evenly over it (#1739: a box built at the
     /// origin, seen from below in orthographic; the XY plane's square z-fought with the bottom
     /// face in stripes). Faces are pushed back by their slope (`FACE_BIAS`), the planes are not.
@@ -8032,14 +8133,90 @@ mod tests {
         assert_eq!(instanced.hover_instanced[0].count(), 2, "both of its placements");
         assert_eq!(instanced.tris.len(), 0);
         assert!(instanced.blocks.iter().all(|b| b.bytes.vertices.is_empty()), "no copy of the placements");
-        // A see-through body is not in the block's opaque triangles: its feedback is built here.
+        // A see-through body is not in the block's opaque runs: its own vertices in the block are
+        // drawn again, recoloured in the highlight's palette, and still no triangle is copied.
         app.viewport.hover_bodies.clear();
         app.run("appearance.assign", json!({"bodies": [body.name.clone()], "color": [200, 200, 200], "opacity": 0.5})).unwrap();
         build_scene(&app);
         app.viewport.hover_bodies = vec![body.name.clone()];
         let see_through = build_highlight(&app);
         assert!(see_through.hover_planned.is_empty(), "a see-through body is not drawn from a plan");
-        assert!(!see_through.merged().tris.is_empty(), "its highlight is still lit");
+        assert_eq!(see_through.recoloured.len(), 1, "it is lit from the model's own vertices");
+        assert!(!see_through.recoloured[0].vertices.is_empty());
+        assert!(see_through.blocks.iter().all(|b| b.bytes.vertices.is_empty()), "no copy of its triangles");
+    }
+
+    /// A whole faded or see-through body lit from the model's own vertices, recoloured in the
+    /// highlight's palette, looks exactly as the copy of its triangles it replaces did: hovered,
+    /// and selected. Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn faded_and_see_through_bodies_light_as_their_copies_did() {
+        const SIZE: u32 = 128;
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 30, "width": 20, "height": 10, "corner": [0, 0, 0], "body_name": "Plate"})).unwrap();
+        s.execute("solid.cylinder", &json!({"base": [45, 10, 0], "diameter": 12, "height": 25, "body_name": "Post"})).unwrap();
+        s.execute("component.from_bodies", &json!({"bodies": ["Post"]})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.fit_view();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+        let render = |model: GpuScene, highlight: GpuScene| {
+            crate::gpu::render_offscreen(
+                model,
+                Some(highlight),
+                proj.vp.to_f32(),
+                proj.cam.back().to_f32(),
+                eye,
+                SIZE,
+                None,
+                [0.0; 8],
+                crate::gpu::analysis_colors(&Tokens::get().analysis),
+            )
+        };
+        for case in ["see-through", "faded"] {
+            match case {
+                "see-through" => drop(app.run("appearance.assign", json!({"bodies": ["Plate"], "color": "#88aacc", "opacity": 0.4})).unwrap()),
+                _ => {
+                    app.run("appearance.assign", json!({"bodies": ["Plate"]})).unwrap();
+                    app.run("component.activate", json!({"component": "Post"})).unwrap();
+                }
+            }
+            for selected in [false, true] {
+                app.viewport.hover_bodies = if selected { Vec::new() } else { vec!["Plate".into()] };
+                app.session.selection = if selected { vec![Sel::Body { name: "Plate".into() }] } else { Vec::new() };
+                let model = build_scene(&app);
+                let highlight = build_highlight(&app);
+                assert_eq!(highlight.recoloured.len(), 1, "{case}: the plate is lit from the model's vertices");
+                let highlight_handed = highlight.clone();
+                // The copy it replaces: every triangle, lit, in the colour the copy was drawn in.
+                let t = Tokens::get();
+                let colour = if selected {
+                    c4(t.body_selected)
+                } else {
+                    let c = body_color(&app.session.doc, &app_body(&app, "Plate")).unwrap_or(t.body);
+                    let k = t.hover_face_lift;
+                    [c.r().saturating_add(k), c.g().saturating_add(k), c.b().saturating_add(k), 255]
+                };
+                // The same highlight (its edges and widgets), the plate copied instead of recoloured.
+                let mut copy = highlight.clone().merged();
+                copy.recoloured.clear();
+                let mesh = drawn_mesh(&app, &app_body(&app, "Plate"));
+                mesh_tris(&mut copy, &mesh, colour, true, |_| true);
+                let (Some(lit), Some(copied)) = (render(model.clone(), highlight_handed), render(model, copy)) else {
+                    eprintln!("skipping: no GPU adapter");
+                    return;
+                };
+                assert!(lit == copied, "{case}, selected {selected}: the recoloured body does not look as its copy did");
+            }
+            app.session.selection.clear();
+        }
+    }
+
+    fn app_body(app: &SolveApp, name: &str) -> solidcraft_engine::doc::ModelBody {
+        app.session.world_state().body(name).cloned().unwrap()
     }
 
     #[test]

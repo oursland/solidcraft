@@ -214,6 +214,155 @@ fn assembly_scene_rebuild_cost() {
     }
 }
 
+/// Hovering the document tree on an assembly: the highlight scene built as the pointer moves
+/// from row to row (one part, one placement of the component, the component's every placement,
+/// the whole design), then back over rows it has lit before. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "manual highlight measurement"]
+fn assembly_tree_hover_highlight_cost() {
+    for (unique, placed) in [(100, 100), (300, 500)] {
+        let mut h = assembly(unique, placed);
+        let _ = crate::viewport::build_scene(&h.app);
+        let st = h.app.session.world_state();
+        let part = st.bodies.iter().find(|b| b.component == 0).map(|b| b.name.clone()).unwrap();
+        let wheels: Vec<String> = st.bodies.iter().filter(|b| b.component != 0).map(|b| b.name.clone()).collect();
+        let everything: Vec<String> = st.bodies.iter().map(|b| b.name.clone()).collect();
+        drop(st);
+        let rows = [("part", vec![part.clone()]), ("placement", wheels[..1].to_vec()), ("component", wheels.clone()), ("design", everything.clone())];
+        let mut line = format!("HOVER unique={unique} placed={placed}");
+        for (name, bodies) in rows.iter() {
+            h.app.viewport.hover_bodies = bodies.clone();
+            let first = ms(|| drop(crate::viewport::build_highlight(&h.app)));
+            line.push_str(&format!(" {name}_ms={first:.2}"));
+        }
+        // Moving back and forth between two rows, as the pointer runs down the tree.
+        let mut again = Vec::new();
+        for i in 0..20 {
+            h.app.viewport.hover_bodies = if i % 2 == 0 { vec![part.clone()] } else { wheels.clone() };
+            again.push(ms(|| drop(crate::viewport::build_highlight(&h.app))));
+        }
+        again.sort_by(f64::total_cmp);
+        line.push_str(&format!(" back_and_forth_median_ms={:.2}", again[again.len() / 2]));
+        h.app.viewport.hover_bodies.clear();
+        let none = ms(|| drop(crate::viewport::build_highlight(&h.app)));
+        line.push_str(&format!(" none_ms={none:.2}"));
+        println!("{line}");
+    }
+}
+
+/// A frame of the viewport for `app`'s camera, drawing the given model and highlight scenes.
+#[cfg(not(target_arch = "wasm32"))]
+fn view_frame(app: &crate::SolveApp, size: u32, model: (u64, &crate::gpu::SceneSlot), highlight: (u64, &crate::gpu::SceneSlot)) -> crate::gpu::Frame {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size as f32, size as f32));
+    let proj = crate::viewport::projection(app, rect);
+    let e = proj.cam.eye().to_f32();
+    let t = crate::theme::Tokens::get();
+    let none = || std::sync::Arc::new(std::sync::Mutex::new(None));
+    crate::gpu::Frame {
+        product: false,
+        key: model.0,
+        slot: model.1.clone(),
+        sketch_key: 0,
+        sketch_slot: none(),
+        hl_key: highlight.0,
+        hl_slot: highlight.1.clone(),
+        pv_key: 0,
+        pv_slot: none(),
+        pv_hide: false,
+        view_proj: proj.vp.to_f32(),
+        back: proj.cam.back().to_f32(),
+        size_px: [size as f32; 2],
+        clip: [0.0; 4],
+        cap: [0.0; 4],
+        images: Vec::new(),
+        analysis: [0.0; 8],
+        analysis_colors: crate::gpu::analysis_colors(&t.analysis),
+        access: None,
+        outline: false,
+        eye: [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }],
+        ao_radius: 0.0,
+        ssaa: 1.0,
+        hover_tint: [f32::from(t.hover_face_lift) / 255.0; 3],
+        selection_tint: [0.4, 0.6, 0.9],
+    }
+}
+
+/// Time hovering four rows of `h`'s tree (one part, one placement, every placement of the
+/// component, the whole design), each hover change building, uploading and drawing the highlight.
+#[cfg(not(target_arch = "wasm32"))]
+fn hover_rows(h: &mut Harness, frames: &mut crate::gpu::OffscreenFrames, size: u32, model_key: u64, label: &str) -> String {
+    let st = h.app.session.world_state();
+    let part = st.bodies.iter().find(|b| b.component == 0).map(|b| b.name.clone()).unwrap();
+    let wheels: Vec<String> = st.bodies.iter().filter(|b| b.component != 0).map(|b| b.name.clone()).collect();
+    let everything: Vec<String> = st.bodies.iter().map(|b| b.name.clone()).collect();
+    drop(st);
+    let model: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(crate::viewport::build_scene(&h.app))));
+    let highlight: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cold = frames.frame(view_frame(&h.app, size, (model_key, &model), (model_key, &highlight)));
+    let mut still = Vec::new();
+    for _ in 0..5 {
+        still.push(frames.frame(view_frame(&h.app, size, (model_key, &model), (model_key, &highlight))));
+    }
+    still.sort_by(f64::total_cmp);
+    let mut line = format!("{label} cold_ms={cold:.1} still_ms={:.2} triangles={}", still[2], frames.stats().triangles);
+    let rows = [("part", vec![part]), ("placement", wheels[..1].to_vec()), ("component", wheels.clone()), ("design", everything)];
+    let mut key = model_key;
+    for (name, bodies) in rows.iter() {
+        let mut times = Vec::new();
+        for _ in 0..7 {
+            // Off the row and back on: each time a new highlight scene, as a sweep does.
+            for hovered in [Vec::new(), bodies.clone()] {
+                h.app.viewport.hover_bodies = hovered;
+                key += 1;
+                let built = std::time::Instant::now();
+                *highlight.lock().unwrap() = Some(crate::viewport::build_highlight(&h.app));
+                let build_ms = built.elapsed().as_secs_f64() * 1000.0;
+                let ms = frames.frame(view_frame(&h.app, size, (model_key, &model), (key, &highlight)));
+                if !h.app.viewport.hover_bodies.is_empty() {
+                    times.push((build_ms + ms, build_ms));
+                }
+            }
+        }
+        times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (total, build) = times[times.len() / 2];
+        line.push_str(&format!(" {name}_ms={total:.2} {name}_build_ms={build:.2}"));
+    }
+    h.app.viewport.hover_bodies.clear();
+    line
+}
+
+/// Hovering the document tree on an assembly, as the window draws it: each hover change builds
+/// the highlight scene, uploads it and draws the frame (GPU work included), on an offscreen
+/// renderer with GPU tessellation where the device has it. Then the same with the component
+/// active (every other part faded, as when working in context) and with see-through parts.
+/// Skipped without a GPU adapter. Run with `--ignored --nocapture`.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "manual highlight measurement"]
+fn assembly_tree_hover_frame_cost() {
+    const SIZE: u32 = 1024;
+    let Some(mut frames) = crate::gpu::OffscreenFrames::new(SIZE, true) else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    for (design, (unique, placed)) in [(100, 100), (300, 500)].into_iter().enumerate() {
+        // Keys of their own for each scene: the renderer keeps a scene while its key comes back.
+        let base = 1_000_000 * (3 * design as u64 + 1);
+        let mut h = assembly(unique, placed);
+        h.app.viewport.gpu =
+            Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: frames.tessellates() });
+        h.app.fit_view();
+        let label = format!("HOVERFRAME unique={unique} placed={placed} tess={}", frames.tessellates());
+        println!("{}", hover_rows(&mut h, &mut frames, SIZE, base, &format!("{label} mode=plain")));
+        h.app.run("component.activate", json!({"component": "Wheel"})).unwrap();
+        println!("{}", hover_rows(&mut h, &mut frames, SIZE, base + 1_000_000, &format!("{label} mode=component_active")));
+        h.app.run("component.activate", json!({"component": 0})).unwrap();
+        let parts: Vec<String> = h.app.session.world_state().bodies.iter().filter(|b| b.component == 0).map(|b| b.name.clone()).collect();
+        h.app.run("appearance.assign", json!({"bodies": parts, "color": "#88aacc", "opacity": 0.5})).unwrap();
+        println!("{}", hover_rows(&mut h, &mut frames, SIZE, base + 2_000_000, &format!("{label} mode=glass_parts")));
+    }
+}
+
 /// A design from a file (`SOLIDCRAFT_SCALE_DESIGN`), every browser folder open: the time of an
 /// idle frame and of the cheap commands, as [`frame_and_cheap_command_cost_by_body_count`].
 #[test]
