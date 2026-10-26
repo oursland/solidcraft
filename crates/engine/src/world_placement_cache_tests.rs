@@ -116,16 +116,21 @@ fn world_cache_requires_exact_design_model_pending_and_author_context() {
     assert!(!Arc::ptr_eq(&authored, &scratch_world));
     assert!(scratch_world.sketch(sketch).unwrap().plane.origin.dist(Vec3::ZERO) < 1e-9);
     assert!(Arc::ptr_eq(&authored, &session.world_state()), "scratch context must not replace the source cache");
+    // Evaluation and placement never read appearances: an appearance edit, its undo and its redo
+    // keep the evaluated model and the placed world (the cache follows the new document).
+    let model = session.model.state();
     run(&mut session, "appearance.assign", json!({"bodies":["Block"],"color":"#ff0000"}));
     let painted = session.world_state();
-    assert!(!Arc::ptr_eq(&authored, &painted));
+    assert!(Arc::ptr_eq(&authored, &painted), "an appearance edit keeps the placed world");
+    assert!(Arc::ptr_eq(&model, &session.model.state()), "and the evaluated model");
     assert_ne!(session.doc.model_body_look(painted.body("Block").unwrap()), None);
     run(&mut session, "edit.undo", json!({}));
     let undone = session.world_state();
-    assert!(!Arc::ptr_eq(&painted, &undone));
+    assert!(Arc::ptr_eq(&painted, &undone), "undoing it too");
+    assert_eq!(session.doc.model_body_look(undone.body("Block").unwrap()), None);
     run(&mut session, "edit.redo", json!({}));
     let redone = session.world_state();
-    assert!(!Arc::ptr_eq(&undone, &redone));
+    assert!(Arc::ptr_eq(&undone, &redone), "and redoing it");
     assert!(session.doc.model_body_look(redone.body("Block").unwrap()).is_some());
     let before_edit = session.world_state();
     run(&mut session, "solid.box", json!({"length":5,"width":6,"height":7,"body_name":"Other","operation":"new"}));
