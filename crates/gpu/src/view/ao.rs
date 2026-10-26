@@ -6,7 +6,7 @@
 //! bits for portable integer texel reads. GLSL cannot load from a depth texture, and float
 //! colour attachments are not available on every GL adapter.
 
-use super::{Batches, ClassGpu, TriSource, color_layout, depth_compare, far_depth, instance_layout, planned_layout, shared_layout, tri_layout};
+use super::{Batches, TriSource, color_layout, depth_compare, far_depth, instance_layout, planned_layout, shared_layout, tri_layout};
 
 pub(super) struct Resources {
     pub layout: wgpu::BindGroupLayout,
@@ -161,23 +161,12 @@ impl Resources {
                     pass.draw(0..*count, 0..1);
                 }
             }
+            // The depth prepass is left out of the performance overlay's counts, as before.
+            let uncounted = super::Tally::default();
             // The blocks' opaque triangles, for the same depth.
             for key in &batch.block_order {
-                let Some(block) = batch.blocks.get(key) else { continue };
-                match &block.opaque {
-                    Some(ClassGpu::Indexed { indices, count }) => {
-                        let Some(vertices) = &block.vertices else { continue };
-                        pass.set_vertex_buffer(0, vertices.slice(..));
-                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..*count, 0, 0..1);
-                    }
-                    Some(ClassGpu::Unindexed(batch)) => {
-                        for (buffer, count) in &batch.parts {
-                            pass.set_vertex_buffer(0, buffer.slice(..));
-                            pass.draw(0..*count, 0..1);
-                        }
-                    }
-                    None => {}
+                if let Some(block) = batch.blocks.get(key) {
+                    block.draw(&mut pass, super::TriClass::Opaque, &uncounted);
                 }
             }
             pass.set_pipeline(&self.planned_pipeline);
@@ -187,8 +176,6 @@ impl Resources {
                 pass.set_index_buffer(draw.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..draw.mesh.index_count, 0, 0..1);
             }
-            // The depth prepass is left out of the performance overlay's counts, as before.
-            let uncounted = super::Tally::default();
             for draw in batch.instanced.iter().filter(|d| d.look == super::InstanceLook::Opaque) {
                 draw.draw(&mut pass, &self.instanced_pipeline, &self.instanced_flat_pipeline, &uncounted);
             }

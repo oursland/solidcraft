@@ -799,17 +799,17 @@ fn resolve_appearance(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> 
 pub(crate) struct CachedBlock {
     bytes: std::sync::Arc<crate::gpu::BlockBytes>,
     meshes: Vec<std::sync::Arc<solidcraft_engine::geom::Mesh>>,
-    /// Each body's share of the block: its vertices and its triangles in the opaque index list
-    /// (whole-body highlights draw those again), and the face classes the lists were built from.
+    /// Each body's share of the block: its vertices, its opaque runs of them (whole-body
+    /// highlights draw those again), and the face classes the runs were built from.
     ranges: Vec<BodyRange>,
 }
 
 /// One body's share of a block.
 struct BodyRange {
     name: String,
+    /// Its vertices: three per triangle, in mesh order (none when its faces are drawn elsewhere).
     vertices: std::ops::Range<u32>,
-    opaque: std::ops::Range<u32>,
-    triangles: usize,
+    opaque: Vec<std::ops::Range<u32>>,
     face_classes: Vec<crate::gpu::TriClass>,
 }
 
@@ -902,17 +902,15 @@ impl BodyDraw {
             m.tri_face.get(ti).and_then(|f| self.face_classes.get(*f as usize)).copied().unwrap_or(crate::gpu::TriClass::Opaque)
         };
         if shaded && !self.on_gpu {
+            let corner = |k: u32| {
+                let i = k as usize;
+                (m.positions.get(i).copied().unwrap_or(Vec3::ZERO).to_f32(), m.normals.get(i).copied().unwrap_or(Vec3::ZERO).to_f32())
+            };
+            // Exactly three vertices per triangle, in mesh order: a class change regenerates the
+            // runs without touching the vertices (see `reindex_block`).
             for (ti, t) in m.triangles.iter().enumerate() {
-                let c = color(ti);
-                // Exactly three vertices per triangle, in mesh order: the class lists can be
-                // regenerated without touching the vertex artifact (PR 2).
-                let v = t.map(|k| {
-                    let i = k as usize;
-                    let p = m.positions.get(i).copied().unwrap_or(Vec3::ZERO).to_f32();
-                    let n = m.normals.get(i).copied().unwrap_or(Vec3::ZERO).to_f32();
-                    out.vertex(p, n, c)
-                });
-                out.triangle(v, class(ti));
+                let [a, b, c] = t.map(corner);
+                out.triangle([a.0, b.0, c.0], [a.1, b.1, c.1], color(ti), class(ti));
             }
         }
         let at = |p: Vec3| self.place.as_ref().map_or(p, |m| solidcraft_engine::doc::apply_point(m, p)).to_f32();
@@ -939,17 +937,15 @@ fn push_block(
     made: &mut std::collections::HashMap<u64, CachedBlock>,
     key: u64,
     draws: Vec<BodyDraw>,
+    shaded: bool,
     build: impl Fn(&BodyDraw, &mut crate::gpu::BlockBuilder),
 ) {
     let same = |c: &CachedBlock| c.meshes.len() == draws.len() && c.meshes.iter().zip(&draws).all(|(m, d)| std::sync::Arc::ptr_eq(m, &d.mesh));
-    let classes_same = |c: &CachedBlock| {
-        c.ranges.len() == draws.len()
-            && c.ranges.iter().zip(&draws).all(|(r, d)| r.triangles == d.mesh.triangles.len() && r.face_classes == d.face_classes)
-    };
+    let classes_same = |c: &CachedBlock| c.ranges.len() == draws.len() && c.ranges.iter().zip(&draws).all(|(r, d)| r.face_classes == d.face_classes);
     let mut block = match kept.remove(&key).or_else(|| made.remove(&key)).filter(same) {
         Some(c) if classes_same(&c) => c,
         Some(c) => reindex_block(c, &draws),
-        None => build_block(&draws, &build),
+        None => build_block(&draws, shaded, &build),
     };
     // The body names are not part of a block's key (its bytes are the same whatever a body is
     // called): keep the ranges' names those of the bodies drawn from them this time.
@@ -980,63 +976,66 @@ fn set_palette_color(
     std::sync::Arc::make_mut(palette).set(slot, rgba);
 }
 
-fn build_block(draws: &[BodyDraw], build: &impl Fn(&BodyDraw, &mut crate::gpu::BlockBuilder)) -> CachedBlock {
+fn build_block(draws: &[BodyDraw], shaded: bool, build: &impl Fn(&BodyDraw, &mut crate::gpu::BlockBuilder)) -> CachedBlock {
     let mut builder = crate::gpu::BlockBuilder::default();
-    let mut ranges = Vec::with_capacity(draws.len());
-    for d in draws {
-        let (v0, o0, _, _) = builder.lens();
-        build(d, &mut builder);
-        let (v1, o1, _, _) = builder.lens();
-        let at = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
-        ranges.push(BodyRange {
-            name: d.name.clone(),
-            vertices: at(v0)..at(v1),
-            opaque: at(o0)..at(o1),
-            triangles: d.mesh.triangles.len(),
-            face_classes: d.face_classes.clone(),
-        });
+    if shaded {
+        builder.reserve_triangles(draws.iter().filter(|d| !d.on_gpu).map(|d| d.mesh.triangles.len()).sum());
     }
+    let at = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
+    let mut spans = Vec::with_capacity(draws.len());
+    for d in draws {
+        let v0 = builder.vertices_len();
+        build(d, &mut builder);
+        spans.push(at(v0)..at(builder.vertices_len()));
+    }
+    let ranges = draws
+        .iter()
+        .zip(spans)
+        .map(|(d, vertices)| BodyRange {
+            name: d.name.clone(),
+            opaque: builder.runs_within(crate::gpu::TriClass::Opaque, vertices.clone()),
+            vertices,
+            face_classes: d.face_classes.clone(),
+        })
+        .collect();
     CachedBlock { bytes: builder.freeze(), meshes: draws.iter().map(|d| d.mesh.clone()).collect(), ranges }
 }
 
-/// Keep a block's vertex, line and hidden artifacts and regenerate only the class index lists
-/// (an opacity class change). Vertices are three per triangle in mesh order, so no mesh pass is
-/// needed.
+/// Keep a block's vertex, line and hidden artifacts and regenerate only the class runs (an
+/// opacity class change). A body's vertices are three per triangle in mesh order, so this reads
+/// each triangle's face, not the mesh's geometry.
 fn reindex_block(block: CachedBlock, draws: &[BodyDraw]) -> CachedBlock {
-    let mut opaque = Vec::new();
-    let mut glass = Vec::new();
-    let mut faded = Vec::new();
-    let mut ranges = Vec::with_capacity(draws.len());
-    let vertex_count = block.bytes.vertices.len() / crate::gpu::TRI_SIZE;
+    use crate::gpu::TriClass;
+    let mut runs: [Vec<std::ops::Range<u32>>; 3] = Default::default();
     for (range, d) in block.ranges.iter().zip(draws) {
-        let opaque_start = opaque.len();
-        let base = range.vertices.start;
-        for j in 0..range.triangles {
-            let class = if d.faded {
-                crate::gpu::TriClass::Faded
-            } else {
-                d.mesh.tri_face.get(j).and_then(|f| d.face_classes.get(*f as usize)).copied().unwrap_or(crate::gpu::TriClass::Opaque)
+        // The triangles this body wrote (none when its faces are drawn from a plan or as an
+        // instance), never more than its mesh has.
+        let written = ((range.vertices.end.saturating_sub(range.vertices.start)) / 3) as usize;
+        for j in 0..written.min(d.mesh.triangles.len()) {
+            let class = d.mesh.tri_face.get(j).and_then(|f| d.face_classes.get(*f as usize)).copied().unwrap_or(TriClass::Opaque);
+            let slot = match class {
+                TriClass::Opaque => 0,
+                TriClass::Glass => 1,
+                TriClass::Faded => 2,
             };
-            let i = base.saturating_add(u32::try_from(j).unwrap_or(u32::MAX).saturating_mul(3));
-            if u32::try_from(vertex_count).unwrap_or(u32::MAX) <= i.saturating_add(2) {
-                continue;
+            let at = range.vertices.start.saturating_add(u32::try_from(j * 3).unwrap_or(u32::MAX));
+            if let Some(list) = runs.get_mut(slot) {
+                crate::gpu::extend_runs(list, at);
             }
-            let list = match class {
-                crate::gpu::TriClass::Opaque => &mut opaque,
-                crate::gpu::TriClass::Glass => &mut glass,
-                crate::gpu::TriClass::Faded => &mut faded,
-            };
-            list.extend_from_slice(&[i, i + 1, i + 2]);
         }
-        let at = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
-        ranges.push(BodyRange {
+    }
+    let [opaque, glass, faded] = runs;
+    let ranges = block
+        .ranges
+        .iter()
+        .zip(draws)
+        .map(|(range, d)| BodyRange {
             name: d.name.clone(),
             vertices: range.vertices.clone(),
-            opaque: at(opaque_start)..at(opaque.len()),
-            triangles: range.triangles,
+            opaque: crate::gpu::runs_within(&opaque, range.vertices.clone()),
             face_classes: d.face_classes.clone(),
-        });
-    }
+        })
+        .collect();
     let old = block.bytes;
     let bytes = std::sync::Arc::new(crate::gpu::BlockBytes {
         vertices: old.vertices.clone(),
@@ -1315,11 +1314,11 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
         if key.is_multiple_of(16) || run.len() >= 64 {
             let draws = std::mem::take(&mut run);
             let block_key = std::mem::replace(&mut run_key, std::collections::hash_map::DefaultHasher::new()).finish();
-            push_block(&mut sc, &mut kept, &mut made, block_key, draws, |d, out| d.build(out, shaded, edges, hidden_edges));
+            push_block(&mut sc, &mut kept, &mut made, block_key, draws, shaded, |d, out| d.build(out, shaded, edges, hidden_edges));
         }
     }
     if !run.is_empty() {
-        push_block(&mut sc, &mut kept, &mut made, run_key.finish(), run, |d, out| d.build(out, shaded, edges, hidden_edges));
+        push_block(&mut sc, &mut kept, &mut made, run_key.finish(), run, shaded, |d, out| d.build(out, shaded, edges, hidden_edges));
     }
     // Where each CPU-built body's triangles are in the model's blocks, for whole-body
     // highlights (see `highlight_block_tris`).
@@ -3428,7 +3427,7 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
             key,
             bytes: std::sync::Arc::new(crate::gpu::BlockBytes {
                 vertices: std::sync::Arc::new(vertices),
-                opaque: std::sync::Arc::new((0..count).collect()),
+                opaque: std::sync::Arc::new(std::iter::once(0..count).filter(|r| !r.is_empty()).collect()),
                 lines: std::sync::Arc::new(std::mem::take(&mut feedback.lines)),
                 hidden: std::sync::Arc::new(std::mem::take(&mut feedback.hidden)),
                 ..Default::default()

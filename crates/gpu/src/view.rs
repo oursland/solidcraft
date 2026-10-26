@@ -500,9 +500,9 @@ impl GpuScene {
         let palette = self.palette.clone();
         let mut out = GpuScene { glass: std::mem::take(&mut self.glass), palette: palette.clone(), ..Default::default() };
         for block in std::mem::take(&mut self.blocks) {
-            append_class(&block.bytes.vertices, &block.bytes.opaque, &mut out.tris);
-            append_class(&block.bytes.vertices, &block.bytes.glass, &mut out.glass);
-            append_class(&block.bytes.vertices, &block.bytes.faded, &mut out.trans);
+            append_runs(&block.bytes.vertices, &block.bytes.opaque, &mut out.tris);
+            append_runs(&block.bytes.vertices, &block.bytes.glass, &mut out.glass);
+            append_runs(&block.bytes.vertices, &block.bytes.faded, &mut out.trans);
             out.lines.extend_from_slice(&block.bytes.lines);
             out.hidden.extend_from_slice(&block.bytes.hidden);
         }
@@ -522,14 +522,25 @@ impl GpuScene {
     }
 }
 
-/// A class's triangles expanded into `TRI_SIZE` vertex records (for the merged/test view).
-fn append_class(vertices: &[u8], indices: &[u32], out: &mut Vec<u8>) {
-    for i in indices {
-        let at = *i as usize * TRI_SIZE;
-        if let Some(v) = vertices.get(at..at + TRI_SIZE) {
+/// A class's triangles as `TRI_SIZE` vertex records: its runs of the block's vertices, in order.
+fn append_runs(vertices: &[u8], runs: &[std::ops::Range<u32>], out: &mut Vec<u8>) {
+    for r in runs {
+        let (a, b) = (r.start as usize * TRI_SIZE, r.end as usize * TRI_SIZE);
+        if let Some(v) = vertices.get(a..b) {
             out.extend_from_slice(v);
         }
     }
+}
+
+/// The part of `runs` (sorted, not overlapping) inside `within`.
+pub fn runs_within(runs: &[std::ops::Range<u32>], within: std::ops::Range<u32>) -> Vec<std::ops::Range<u32>> {
+    let first = runs.partition_point(|r| r.end <= within.start);
+    runs[first..]
+        .iter()
+        .take_while(|r| r.start < within.end)
+        .map(|r| r.start.max(within.start)..r.end.min(within.end))
+        .filter(|r| !r.is_empty())
+        .collect()
 }
 
 /// A run of the model's bodies in the scene: their triangles and edges, and a key that names
@@ -545,10 +556,10 @@ pub struct SceneBlock {
 pub struct BlockTris {
     /// The block's key ([`SceneBlock::key`]).
     pub block: u64,
-    /// The body's triangles in the block's opaque index list.
-    pub tris: std::ops::Range<u32>,
-    /// The body's vertices in the block's canonical vertex stream (a block too large to index
-    /// draws unindexed; its highlights are then skipped).
+    /// The body's opaque triangles: runs of the block's vertices (a block too large for one
+    /// vertex buffer draws from copies instead; its highlights are then skipped).
+    pub tris: Vec<std::ops::Range<u32>>,
+    /// All of the body's vertices in the block's canonical vertex stream.
     pub vertices: std::ops::Range<u32>,
 }
 
@@ -560,49 +571,85 @@ pub enum TriClass {
     Faded,
 }
 
-/// A block's geometry: one canonical triangle vertex stream (`TRI_SIZE` each) and one index list
-/// per draw class, so a color/opacity edit changes no vertex, and an opacity class change changes
-/// only the affected list.
+/// A block's geometry: one canonical triangle vertex stream (`TRI_SIZE` bytes a vertex, three a
+/// triangle) and, per draw class, the runs of that stream the class draws. A colour or opacity
+/// edit changes no vertex; an opacity class change changes only the runs, which are drawn
+/// straight from the vertex buffer (no index buffer to upload).
 #[derive(Default, Clone)]
 pub struct BlockBytes {
     pub vertices: Arc<Vec<u8>>,
-    pub opaque: Arc<Vec<u32>>,
-    pub glass: Arc<Vec<u32>>,
-    pub faded: Arc<Vec<u32>>,
+    pub opaque: Arc<Vec<std::ops::Range<u32>>>,
+    pub glass: Arc<Vec<std::ops::Range<u32>>>,
+    pub faded: Arc<Vec<std::ops::Range<u32>>>,
     pub lines: Arc<Vec<u8>>,
     pub hidden: Arc<Vec<u8>>,
 }
 
-/// Builds a [`BlockBytes`], writing vertices once and filing each triangle by class.
+impl BlockBytes {
+    /// The runs of `class`.
+    pub fn runs(&self, class: TriClass) -> &Arc<Vec<std::ops::Range<u32>>> {
+        match class {
+            TriClass::Opaque => &self.opaque,
+            TriClass::Glass => &self.glass,
+            TriClass::Faded => &self.faded,
+        }
+    }
+}
+
+/// Add a triangle starting at vertex `at` to `runs`, extending the last run when it ends there.
+pub fn extend_runs(runs: &mut Vec<std::ops::Range<u32>>, at: u32) {
+    let end = at.saturating_add(3);
+    match runs.last_mut() {
+        Some(last) if last.end == at => last.end = end,
+        _ => runs.push(at..end),
+    }
+}
+
+/// Builds a [`BlockBytes`], writing each triangle's vertices once and filing it by class.
 #[derive(Default)]
 pub struct BlockBuilder {
     vertices: Vec<u8>,
-    opaque: Vec<u32>,
-    glass: Vec<u32>,
-    faded: Vec<u32>,
+    opaque: Vec<std::ops::Range<u32>>,
+    glass: Vec<std::ops::Range<u32>>,
+    faded: Vec<std::ops::Range<u32>>,
     lines: Vec<u8>,
     hidden: Vec<u8>,
 }
 
 impl BlockBuilder {
-    /// Add a vertex (position, normal, palette index) and return its index.
-    pub fn vertex(&mut self, p: [f32; 3], n: [f32; 3], c: PaletteIndex) -> u32 {
-        let i = u32::try_from(self.vertices.len() / TRI_SIZE).unwrap_or(u32::MAX);
-        for v in p.iter().chain(&n) {
-            self.vertices.extend_from_slice(&v.to_le_bytes());
-        }
-        self.vertices.extend_from_slice(&c.0.to_le_bytes());
-        i
+    /// Room for `triangles` more triangles, so a block of large bodies is written without
+    /// reallocating (and copying) its vertex stream as it grows.
+    pub fn reserve_triangles(&mut self, triangles: usize) {
+        let _ = self.vertices.try_reserve_exact(triangles.saturating_mul(3 * TRI_SIZE));
     }
 
-    /// File a triangle (three vertex indices from [`BlockBuilder::vertex`]) under `class`.
-    pub fn triangle(&mut self, v: [u32; 3], class: TriClass) {
-        let list = match class {
+    /// Add a triangle (three positions and normals, one palette index) under `class`.
+    pub fn triangle(&mut self, p: [[f32; 3]; 3], n: [[f32; 3]; 3], c: PaletteIndex, class: TriClass) {
+        let at = u32::try_from(self.vertices.len() / TRI_SIZE).unwrap_or(u32::MAX);
+        let mut record = [0u8; 3 * TRI_SIZE];
+        for ((out, p), n) in record.as_chunks_mut::<TRI_SIZE>().0.iter_mut().zip(p).zip(n) {
+            let words = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), n[0].to_bits(), n[1].to_bits(), n[2].to_bits(), c.0];
+            for (w, slot) in words.iter().zip(out.as_chunks_mut::<4>().0) {
+                *slot = w.to_le_bytes();
+            }
+        }
+        self.vertices.extend_from_slice(&record);
+        let runs = match class {
             TriClass::Opaque => &mut self.opaque,
             TriClass::Glass => &mut self.glass,
             TriClass::Faded => &mut self.faded,
         };
-        list.extend_from_slice(&v);
+        extend_runs(runs, at);
+    }
+
+    /// The runs of `class` that fall within `vertices` (a body's share of the block).
+    pub fn runs_within(&self, class: TriClass, vertices: std::ops::Range<u32>) -> Vec<std::ops::Range<u32>> {
+        let runs = match class {
+            TriClass::Opaque => &self.opaque,
+            TriClass::Glass => &self.glass,
+            TriClass::Faded => &self.faded,
+        };
+        runs_within(runs, vertices)
     }
 
     /// A depth-tested line, or one only shown where the model hides it.
@@ -624,26 +671,9 @@ impl BlockBuilder {
         out.extend_from_slice(&width.to_le_bytes());
     }
 
-    /// How many vertices (or entries in a class's index list) the block holds so far.
+    /// How many vertices the block holds so far.
     pub fn vertices_len(&self) -> usize {
         self.vertices.len() / TRI_SIZE
-    }
-
-    pub fn opaque_len(&self) -> usize {
-        self.opaque.len()
-    }
-
-    pub fn glass_len(&self) -> usize {
-        self.glass.len()
-    }
-
-    pub fn faded_len(&self) -> usize {
-        self.faded.len()
-    }
-
-    /// The blocks' artifact lengths, for per-body ranges before freezing.
-    pub fn lens(&self) -> (usize, usize, usize, usize) {
-        (self.vertices_len(), self.opaque_len(), self.glass_len(), self.faded_len())
     }
 
     /// The block, frozen for the scene and the GPU cache.
@@ -1130,16 +1160,22 @@ impl LevelDraw {
     }
 }
 
-/// One class's index list on the GPU, or its triangles expanded when the block is too large to
-/// index (a single vertex buffer per block is required by `draw_indexed`).
+/// Most runs a class draws one by one; a class broken into more (faces of their own opacity all
+/// over a body) is drawn through an index buffer instead, in one call.
+const MAX_RUNS: usize = 64;
+
+/// One class's triangles on the GPU: runs of the block's vertex buffer (no buffer of their own),
+/// an index buffer for a fragmented class, or copies of its triangles when the block is too large
+/// for one vertex buffer.
 #[derive(Clone)]
 enum ClassGpu {
+    Runs(Arc<Vec<std::ops::Range<u32>>>),
     Indexed { indices: wgpu::Buffer, count: u32 },
     Unindexed(Batch),
 }
 
 /// A scene block on the GPU, with the bytes it was uploaded from. Each artifact is kept while
-/// its `Arc` comes back, so an appearance class change re-uploads only the index lists.
+/// its `Arc` comes back, so an opacity class change uploads nothing for a class drawn by runs.
 struct BlockGpu {
     bytes: Arc<BlockBytes>,
     vertices: Option<wgpu::Buffer>,
@@ -1150,62 +1186,47 @@ struct BlockGpu {
     hidden: Option<Batch>,
 }
 
-/// A class's triangles expanded into `TRI_SIZE` vertex records (for a block too large to index).
-fn expanded_class(vertices: &[u8], indices: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(indices.len() * TRI_SIZE);
-    for i in indices {
-        let at = *i as usize * TRI_SIZE;
-        if let Some(v) = vertices.get(at..at + TRI_SIZE) {
-            out.extend_from_slice(v);
-        }
-    }
-    out
-}
-
 fn class_gpu(
     device: &wgpu::Device,
-    indexed: bool,
+    fits: bool,
     vertices: &[u8],
-    indices: &Arc<Vec<u32>>,
-    old: Option<(&ClassGpu, &Arc<Vec<u32>>)>,
+    runs: &Arc<Vec<std::ops::Range<u32>>>,
+    old: Option<(&ClassGpu, &Arc<Vec<std::ops::Range<u32>>>)>,
     same_vertices: bool,
 ) -> Option<ClassGpu> {
-    if indices.is_empty() {
+    if runs.is_empty() {
         return None;
     }
-    if indexed {
-        if let (Some((ClassGpu::Indexed { indices: buffer, count }, _)), true) = (old, old_indices_match(old, indices)) {
-            return Some(ClassGpu::Indexed { indices: buffer.clone(), count: *count });
-        }
-        let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sc_block_indices"),
-            contents: &bytes,
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        Some(ClassGpu::Indexed { indices: buffer, count: u32::try_from(indices.len()).unwrap_or(u32::MAX) })
-    } else {
-        if let (Some((ClassGpu::Unindexed(batch), _)), true) = (old, same_vertices && old_indices_match(old, indices)) {
+    let same_runs = old.is_some_and(|(_, old_runs)| Arc::ptr_eq(old_runs, runs));
+    if !fits {
+        if let (Some((ClassGpu::Unindexed(batch), _)), true) = (old, same_vertices && same_runs) {
             return Some(ClassGpu::Unindexed(batch.clone()));
         }
-        upload(device, "sc_block_class", &expanded_class(vertices, indices), TRI_SIZE).map(ClassGpu::Unindexed)
+        let mut bytes = Vec::new();
+        append_runs(vertices, runs, &mut bytes);
+        return upload(device, "sc_block_class", &bytes, TRI_SIZE).map(ClassGpu::Unindexed);
     }
-}
-
-/// Whether the class kept on the GPU was uploaded from exactly `indices`.
-fn old_indices_match(old: Option<(&ClassGpu, &Arc<Vec<u32>>)>, indices: &Arc<Vec<u32>>) -> bool {
-    old.is_some_and(|(_, old_indices)| Arc::ptr_eq(old_indices, indices))
+    if runs.len() <= MAX_RUNS {
+        return Some(ClassGpu::Runs(runs.clone()));
+    }
+    if let (Some((ClassGpu::Indexed { indices, count }, _)), true) = (old, same_runs) {
+        return Some(ClassGpu::Indexed { indices: indices.clone(), count: *count });
+    }
+    let bytes: Vec<u8> = runs.iter().flat_map(|r| r.clone()).flat_map(|i| i.to_le_bytes()).collect();
+    let count = u32::try_from(bytes.len() / 4).unwrap_or(u32::MAX);
+    let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sc_block_indices"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    Some(ClassGpu::Indexed { indices, count })
 }
 
 impl BlockGpu {
     fn update(device: &wgpu::Device, old: Option<BlockGpu>, bytes: Arc<BlockBytes>) -> BlockGpu {
-        let limit = device.limits().max_buffer_size;
-        let indexed = bytes.vertices.len() as u64 <= limit
-            && bytes.opaque.len() as u64 * 4 <= limit
-            && bytes.glass.len() as u64 * 4 <= limit
-            && bytes.faded.len() as u64 * 4 <= limit;
+        let fits = bytes.vertices.len() as u64 <= device.limits().max_buffer_size;
         let same_vertices = old.as_ref().is_some_and(|o| Arc::ptr_eq(&o.bytes.vertices, &bytes.vertices));
-        let vertices = if !indexed || bytes.vertices.is_empty() {
+        let vertices = if !fits || bytes.vertices.is_empty() {
             None
         } else if same_vertices {
             old.as_ref().and_then(|o| o.vertices.clone())
@@ -1216,19 +1237,54 @@ impl BlockGpu {
                 usage: wgpu::BufferUsages::VERTEX,
             }))
         };
-        let class = |old: Option<&BlockGpu>, pick: fn(&BlockBytes) -> &Arc<Vec<u32>>, old_class: fn(&BlockGpu) -> Option<&ClassGpu>| {
-            let old_pair = old.and_then(|o| old_class(o).map(|c| (c, pick(&o.bytes))));
-            class_gpu(device, indexed, &bytes.vertices, pick(&bytes), old_pair, same_vertices)
+        let class = |class: TriClass| {
+            let old_pair = old.as_ref().and_then(|o| o.class(class).map(|c| (c, o.bytes.runs(class))));
+            class_gpu(device, fits, &bytes.vertices, bytes.runs(class), old_pair, same_vertices)
         };
-        let opaque = class(old.as_ref(), |b| &b.opaque, |b| b.opaque.as_ref());
-        let glass = class(old.as_ref(), |b| &b.glass, |b| b.glass.as_ref());
-        let faded = class(old.as_ref(), |b| &b.faded, |b| b.faded.as_ref());
+        let (opaque, glass, faded) = (class(TriClass::Opaque), class(TriClass::Glass), class(TriClass::Faded));
         let keep = |old: Option<&BlockGpu>, pick: fn(&BlockBytes) -> &Arc<Vec<u8>>, old_lines: fn(&BlockGpu) -> Option<&Batch>| {
             old.filter(|o| Arc::ptr_eq(pick(&o.bytes), pick(&bytes))).and_then(old_lines).cloned()
         };
         let lines = keep(old.as_ref(), |b| &b.lines, |b| b.lines.as_ref()).or_else(|| upload(device, "sc_block_lines", &bytes.lines, LINE_SIZE));
         let hidden = keep(old.as_ref(), |b| &b.hidden, |b| b.hidden.as_ref()).or_else(|| upload(device, "sc_block_hidden", &bytes.hidden, LINE_SIZE));
         BlockGpu { bytes, vertices, opaque, glass, faded, lines, hidden }
+    }
+
+    fn class(&self, class: TriClass) -> Option<&ClassGpu> {
+        match class {
+            TriClass::Opaque => self.opaque.as_ref(),
+            TriClass::Glass => self.glass.as_ref(),
+            TriClass::Faded => self.faded.as_ref(),
+        }
+    }
+
+    /// Draw `class`'s triangles with the pipeline already set (`tally`: what is counted).
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, class: TriClass, tally: &Tally) {
+        match self.class(class) {
+            Some(ClassGpu::Runs(runs)) => {
+                let Some(vertices) = &self.vertices else { return };
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                for r in runs.iter() {
+                    pass.draw(r.clone(), 0..1);
+                    tally.triangles(r.len() as u32, 1);
+                }
+            }
+            Some(ClassGpu::Indexed { indices, count }) => {
+                let Some(vertices) = &self.vertices else { return };
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+                tally.triangles(*count, 1);
+            }
+            Some(ClassGpu::Unindexed(batch)) => {
+                for (buffer, count) in &batch.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                    tally.triangles(*count, 1);
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -1463,7 +1519,7 @@ impl Batches {
             self.glass_cpu.extend_from_slice(&sc.glass);
             if !oit_available {
                 for block in &sc.blocks {
-                    append_class(&block.bytes.vertices, &block.bytes.glass, &mut self.glass_cpu);
+                    append_runs(&block.bytes.vertices, &block.bytes.glass, &mut self.glass_cpu);
                 }
             }
             self.glass = upload_with(device, "sc_glass", &self.glass_cpu, TRI_SIZE, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
@@ -2906,33 +2962,13 @@ impl Renderer {
         } else {
             (&res.model, &res.sketch, &res.highlight, &res.preview)
         };
-        // A block's triangles, drawn from its canonical vertex buffer and the class's index list.
+        // A block's triangles of one class, drawn from its canonical vertex buffer.
         let block_class = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, class: TriClass| {
             for key in &m.block_order {
                 let Some(block) = m.blocks.get(key) else { continue };
-                let list = match class {
-                    TriClass::Opaque => &block.opaque,
-                    TriClass::Glass => &block.glass,
-                    TriClass::Faded => &block.faded,
-                };
-                match list {
-                    Some(ClassGpu::Indexed { indices, count }) => {
-                        let Some(vertices) = &block.vertices else { continue };
-                        pass.set_pipeline(p);
-                        pass.set_vertex_buffer(0, vertices.slice(..));
-                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..*count, 0, 0..1);
-                        tally.triangles(*count, 1);
-                    }
-                    Some(ClassGpu::Unindexed(batch)) => {
-                        pass.set_pipeline(p);
-                        for (buffer, count) in &batch.parts {
-                            pass.set_vertex_buffer(0, buffer.slice(..));
-                            pass.draw(0..*count, 0..1);
-                            tally.triangles(*count, 1);
-                        }
-                    }
-                    None => {}
+                if block.class(class).is_some() {
+                    pass.set_pipeline(p);
+                    block.draw(pass, class, tally);
                 }
             }
         };
@@ -2980,18 +3016,18 @@ impl Renderer {
                 }
             }
         };
-        // Whole highlighted bodies the model builds on the CPU: their range in a block's opaque
-        // index list (a block too large to index has its highlight skipped).
+        // Whole highlighted bodies the model builds on the CPU: their runs of a block's vertex
+        // buffer (a block too large for one vertex buffer has its highlight skipped).
         let tinted_blocks = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, refs: &[BlockTris]| {
             for r in refs {
                 let Some(block) = m.blocks.get(&r.block) else { continue };
-                let Some(ClassGpu::Indexed { indices, .. }) = &block.opaque else { continue };
                 let Some(vertices) = &block.vertices else { continue };
                 pass.set_pipeline(p);
                 pass.set_vertex_buffer(0, vertices.slice(..));
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(r.tris.clone(), 0, 0..1);
-                tally.triangles(r.tris.len() as u32, 1);
+                for run in &r.tris {
+                    pass.draw(run.clone(), 0..1);
+                    tally.triangles(run.len() as u32, 1);
+                }
             }
         };
         // Whole highlighted bodies the model draws as placements of shared triangles: the same
@@ -3143,31 +3179,11 @@ impl Renderer {
                 tally.triangles(*count, 1);
             }
         }
-        // The blocks' see-through triangles, straight from their index lists (nothing sorted).
+        // The blocks' see-through triangles, straight from their vertex buffers (nothing sorted).
         for class in [TriClass::Glass, TriClass::Faded] {
             for key in &m.block_order {
-                let Some(block) = m.blocks.get(key) else { continue };
-                let list = match class {
-                    TriClass::Glass => &block.glass,
-                    TriClass::Faded => &block.faded,
-                    TriClass::Opaque => continue,
-                };
-                match list {
-                    Some(ClassGpu::Indexed { indices, count }) => {
-                        let Some(vertices) = &block.vertices else { continue };
-                        pass.set_vertex_buffer(0, vertices.slice(..));
-                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..*count, 0, 0..1);
-                        tally.triangles(*count, 1);
-                    }
-                    Some(ClassGpu::Unindexed(batch)) => {
-                        for (buffer, count) in &batch.parts {
-                            pass.set_vertex_buffer(0, buffer.slice(..));
-                            pass.draw(0..*count, 0..1);
-                            tally.triangles(*count, 1);
-                        }
-                    }
-                    None => {}
+                if let Some(block) = m.blocks.get(key) {
+                    block.draw(pass, class, tally);
                 }
             }
         }

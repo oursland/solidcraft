@@ -201,7 +201,7 @@ fn a_colour_edit_reuses_every_block_vertex() {
 }
 
 #[test]
-fn an_opacity_class_change_keeps_vertices_and_rewrites_only_indices() {
+fn an_opacity_class_change_keeps_vertices_and_rewrites_only_the_runs() {
     let mut app = SolveApp::new(Session::default(), Services::default());
     app.ui.ground_shadow = false;
     app.set_origin_shown(false);
@@ -214,9 +214,12 @@ fn an_opacity_class_change_keeps_vertices_and_rewrites_only_indices() {
     let second = build_scene(&app);
     let block = second.blocks.iter().find(|b| b.key == key).expect("the block key is geometry's");
     assert!(std::sync::Arc::ptr_eq(&bytes.vertices, &block.bytes.vertices), "the class change keeps every vertex");
-    assert!(!std::sync::Arc::ptr_eq(&bytes.opaque, &block.bytes.opaque), "the opaque list changes");
-    assert!(block.bytes.opaque.is_empty() && !block.bytes.glass.is_empty(), "the triangles moved to the glass list");
-    let vertex = block.bytes.glass.first().copied().unwrap_or(0) as usize;
+    assert!(!std::sync::Arc::ptr_eq(&bytes.opaque, &block.bytes.opaque), "the opaque runs change");
+    assert!(block.bytes.opaque.is_empty() && !block.bytes.glass.is_empty(), "the triangles moved to the glass runs");
+    let triangles: u32 = block.bytes.glass.iter().map(|r| r.len() as u32).sum::<u32>() / 3;
+    assert_eq!(block.bytes.glass.len(), 1, "one body of one class is one run, drawn with no index buffer");
+    assert_eq!(triangles, 12, "every triangle of the box");
+    let vertex = block.bytes.glass.first().map_or(0, |r| r.start) as usize;
     let at = vertex * crate::gpu::TRI_SIZE;
     let colour = first_vertex(&second, block.bytes.vertices.get(at..).unwrap_or_default()).1;
     assert_eq!(colour.map(|c| c[3]), Some(128), "0.5 of 255");
