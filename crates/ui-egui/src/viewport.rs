@@ -3226,20 +3226,21 @@ pub(crate) fn build_highlight(app: &SolveApp) -> GpuScene {
     // circle in a point input its centre, as construction geometry. The axis runs through the
     // solid it belongs to, so it is drawn over the model.
     let (round_axes, round_centres) = round_pick_feedback(app);
+    let construction = sc.color(c4(t.construction_geom));
     for (a, b) in round_axes {
         let len = a.dist(b);
         let dash = size * 0.08;
         let mut s = 0.0;
         while s < len {
             let e = (s + dash).min(len);
-            sc.line(a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), c4(t.construction_geom), 2.0, true);
+            sc.line(a.lerp(b, s / len).to_f32(), a.lerp(b, e / len).to_f32(), construction, 2.0, true);
             s += dash * 1.6;
         }
     }
     for p in round_centres {
         let r = size * 0.04;
         for d in [Vec3::X, Vec3::Y, Vec3::Z] {
-            sc.line((p - d * r).to_f32(), (p + d * r).to_f32(), c4(t.construction_geom), 2.0, true);
+            sc.line((p - d * r).to_f32(), (p + d * r).to_f32(), construction, 2.0, true);
         }
     }
     // Reference widgets follow zoom; the often much larger world-space feedback does not.
