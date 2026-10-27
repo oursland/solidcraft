@@ -262,3 +262,28 @@ fn joint_drive_reuses_reference_tessellation_across_rigid_poses() {
     }
     assert_eq!(local.bounds(), bounds, "old snapshots stay immutable");
 }
+
+/// Commands map world body names through every body's frame: worked out once while the world
+/// state is current, and again when a placement moves or a body is added.
+#[test]
+fn body_frames_are_kept_with_the_world_state() {
+    let mut session = Session::default();
+    let first = run(&mut session, "component.create", json!({"name":"Part"}))["occurrence"].as_u64().unwrap();
+    run(&mut session, "solid.box", json!({"length":2,"width":3,"height":4,"body_name":"Block","operation":"new"}));
+    let second = run(&mut session, "occurrence.copy", json!({"occurrence":first}))["occurrence"].as_u64().unwrap();
+    let _ = session.world_state();
+    let frames = session.body_frames();
+    assert!(Arc::ptr_eq(&frames, &session.body_frames()), "kept while the world state is current");
+    let copy = session.occurrence_placement(&[second]).unwrap().bodies[0].world.clone();
+    assert!(frames.iter().any(|(world, own, _)| *world == copy && own == "Block"), "a copy maps back to its definition");
+    run(&mut session, "occurrence.move", json!({"occurrence":second,"translate":[10,0,0],"capture":false}));
+    let _ = session.world_state();
+    let moved = session.body_frames();
+    assert!(!Arc::ptr_eq(&frames, &moved), "a moved placement works them out again");
+    let at = |frames: &crate::BodyFrames| frames.iter().find(|(world, ..)| *world == copy).map(|(_, _, m)| m[3][0]);
+    assert_eq!(at(&moved), Some(10.0), "with the placement's new frame");
+    assert_eq!(at(&frames), Some(0.0));
+    run(&mut session, "solid.box", json!({"length":1,"width":1,"height":1,"body_name":"Other","operation":"new"}));
+    let _ = session.world_state();
+    assert!(session.body_frames().iter().any(|(world, ..)| world.starts_with("Other")), "a new body is in them");
+}
