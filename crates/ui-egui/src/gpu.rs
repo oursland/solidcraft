@@ -27,6 +27,8 @@ pub fn install(rs: &egui_wgpu::RenderState, scene: GpuTarget, window: GpuTarget,
     let scene = GpuTarget { tess: tess.is_some(), ..scene };
     let window = GpuTarget { tess: tess.is_some(), ..window };
     let res = Renderer::with_window_target(&rs.device, scene, window, tess);
+    // What the renderer can do (order-independent transparency), not only what was asked for.
+    let scene = res.target();
     let stats = res.stats();
     rs.renderer.write().callback_resources.insert(res);
     (scene, stats)
@@ -333,7 +335,7 @@ fn offscreen(
     let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
     let depth = solidcraft_gpu::depth_format(&device, true);
     let compute = tess.and_then(|shader| solidcraft_gpu::view::tessellation(&adapter, &device, &queue, shader));
-    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some() };
+    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some(), oit: false };
     let mut resources = egui_wgpu::CallbackResources::default();
     resources.insert(Renderer::new(&device, target, compute));
     let none = || Arc::new(Mutex::new(None));
@@ -448,7 +450,7 @@ impl OffscreenFrames {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let depth = solidcraft_gpu::depth_format(&device, true);
         let compute = if tess { solidcraft_gpu::view::tessellation(&adapter, &device, &queue, solidcraft_gpu::SHADER) } else { None };
-        let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some() };
+        let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some(), oit: false };
         let mut resources = egui_wgpu::CallbackResources::default();
         resources.insert(Renderer::new(&device, target, compute));
         let texture = |format, usage| {
@@ -468,6 +470,12 @@ impl OffscreenFrames {
         let color = texture(format, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let depth = texture(depth, wgpu::TextureUsages::RENDER_ATTACHMENT);
         Some(OffscreenFrames { device, queue, resources, color, depth, size })
+    }
+
+    /// What the renderer can do, as the viewport is told when the window's renderer is
+    /// installed (plans evaluated, order-independent transparency).
+    pub(crate) fn target(&self) -> Option<GpuTarget> {
+        self.resources.get::<Renderer>().map(Renderer::target)
     }
 
     /// Whether the device evaluates plans (so scenes should be built with `tess`).

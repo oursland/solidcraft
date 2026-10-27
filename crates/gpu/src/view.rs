@@ -160,6 +160,9 @@ const UNIFORM_SIZE: u64 = 416;
 pub struct PlannedBody {
     pub plan: Arc<solidcraft_geom::tess::TessPlan>,
     pub face_colors: Vec<PaletteIndex>,
+    /// How the whole body is drawn: opaque with the model, or faded or see-through blended
+    /// order-independently (only on a renderer that does that: [`GpuTarget::oit`]).
+    pub class: TriClass,
 }
 
 /// What the viewport's last frame drew, counted as it was drawn (the performance overlay, #2548).
@@ -1000,6 +1003,8 @@ struct Batch {
 struct PlannedDraw {
     mesh: Arc<crate::GpuMesh>,
     colors: wgpu::Buffer,
+    /// Its bodies' class: a chunk holds bodies of one class.
+    class: TriClass,
     /// The address of each plan in the chunk, in `mesh.parts` order: a whole-body highlight
     /// finds the evaluated triangles of the body it lights.
     plans: Vec<usize>,
@@ -1736,7 +1741,7 @@ impl Batches {
         for b in bodies {
             let n = b.plan.vertex_count();
             match chunks.last_mut() {
-                Some(c) if open && filled + n <= crate::MAX_BATCH => c.push(b),
+                Some(c) if open && filled + n <= crate::MAX_BATCH && c.first().is_some_and(|f| f.class == b.class) => c.push(b),
                 _ => {
                     chunks.push(vec![b]);
                     filled = 0;
@@ -1780,7 +1785,8 @@ impl Batches {
             }
             self.uploads.planned += bytes.len() as u64;
             if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
-                out.push(PlannedDraw { mesh, colors, plans: key(chunk) });
+                let class = chunk.first().map_or(TriClass::Opaque, |b| b.class);
+                out.push(PlannedDraw { mesh, colors, class, plans: key(chunk) });
             }
         }
         out
@@ -2126,6 +2132,10 @@ pub struct GpuTarget {
     pub samples: u32,
     /// The device evaluates display plans (compute shaders): bodies may be drawn from them.
     pub tess: bool,
+    /// The renderer blends see-through surfaces order-independently: faded and see-through
+    /// bodies may be drawn from their plans too (they need no sorting on the CPU). Set by the
+    /// renderer ([`Renderer::target`]); asking for it does not make it so.
+    pub oit: bool,
 }
 
 impl GpuTarget {
@@ -2548,7 +2558,7 @@ impl Renderer {
             ao,
             depth_reset,
             section_reset: t.depth.filter(|f| f.has_stencil_aspect()).and_then(|_| depth_reset_pipeline(device, t)),
-            target: t,
+            target: GpuTarget { oit: oit.is_some(), ..t },
             window,
             max_texture: device.limits().max_texture_dimension_2d,
             ss_blit,
@@ -2743,6 +2753,7 @@ impl Batches {
     fn see_through(&self) -> bool {
         self.glass.is_some()
             || self.trans.is_some()
+            || self.planned.iter().any(|d| d.class != TriClass::Opaque)
             || self.instanced.iter().any(|d| d.look != InstanceLook::Opaque)
             || self.block_order.iter().any(|k| self.blocks.get(k).is_some_and(|b| b.glass.is_some() || b.faded.is_some()))
     }
@@ -3078,7 +3089,7 @@ impl Renderer {
         pass.set_bind_group(2, &res.ao.bind, &[]);
         pass.set_bind_group(0, scene_bind(m, &res.bind), &[]);
         let planned = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline| {
-            for d in &m.planned {
+            for d in m.planned.iter().filter(|d| d.class == TriClass::Opaque) {
                 pass.set_pipeline(p);
                 pass.set_vertex_buffer(0, d.mesh.vertices.slice(..));
                 pass.set_vertex_buffer(1, d.colors.slice(..));
@@ -3294,6 +3305,18 @@ impl Renderer {
                 if let Some(block) = m.blocks.get(key) {
                     block.draw(pass, class, tally);
                 }
+            }
+        }
+        // Faded and see-through bodies drawn from their plans.
+        let mut planned = m.planned.iter().filter(|d| d.class != TriClass::Opaque).peekable();
+        if planned.peek().is_some() {
+            pass.set_pipeline(&p.planned);
+            for d in planned {
+                pass.set_vertex_buffer(0, d.mesh.vertices.slice(..));
+                pass.set_vertex_buffer(1, d.colors.slice(..));
+                pass.set_index_buffer(d.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..d.mesh.index_count, 0, 0..1);
+                tally.triangles(d.mesh.index_count, 1);
             }
         }
         for d in m.instanced.iter().filter(|d| d.look != InstanceLook::Opaque) {
@@ -3886,7 +3909,8 @@ mod glass_tests {
     fn a_colour_edit_keeps_the_sorted_glass_stream() {
         let Ok((_, device, queue)) = crate::open_headless() else { return };
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(crate::depth_format(&device, true)), samples: 1, tess: false }, None);
+        let mut r =
+            Renderer::new(&device, GpuTarget { format, depth: Some(crate::depth_format(&device, true)), samples: 1, tess: false, oit: false }, None);
         let mut palette = Palette::with_stable(vec![[200, 0, 0, 128]]);
         let mut b = BlockBuilder::default();
         b.triangle([[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0]; 3], PaletteIndex(0), TriClass::Glass);
@@ -3927,7 +3951,7 @@ mod glass_tests {
         let (_, device, queue) = crate::open_headless().ok()?;
         let depth = crate::depth_format(&device, true);
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples, tess: false }, None);
+        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples, tess: false, oit: false }, None);
         assert!(r.oit.is_some(), "this device does order-independent transparency");
         if !oit {
             r.oit = None;
@@ -4151,7 +4175,7 @@ mod glass_tests {
         let Some((_, device, queue)) = crate::open_headless().ok() else { return };
         let depth = crate::depth_format(&device, true);
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples: 1, tess: false }, None);
+        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples: 1, tess: false, oit: false }, None);
         // Supersampled: the picture is drawn into a texture, so it can be cached.
         let mut frame = test_frame(test_scene(), 2.0);
         let first = render_frame(&mut r, &device, &queue, &frame, true);
@@ -4174,8 +4198,8 @@ mod glass_tests {
         let Some((_, device, queue)) = crate::open_headless().ok() else { return };
         let depth = crate::depth_format(&device, true);
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let scene_target = GpuTarget { format, depth: Some(depth), samples: 1, tess: false };
-        let window_target = GpuTarget { format, depth: None, samples: 1, tess: false };
+        let scene_target = GpuTarget { format, depth: Some(depth), samples: 1, tess: false, oit: false };
+        let window_target = GpuTarget { format, depth: None, samples: 1, tess: false, oit: false };
         let mut direct = Renderer::new(&device, scene_target, None);
         let mut split = Renderer::with_window_target(&device, scene_target, window_target, None);
         // Each renderer takes the scene out of its slot: a frame of its own for each.
@@ -4194,7 +4218,7 @@ mod glass_tests {
         let Some((_, device, queue)) = crate::open_headless().ok() else { return };
         let depth = crate::depth_format(&device, true);
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples: 1, tess: false }, None);
+        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples: 1, tess: false, oit: false }, None);
         let middle = |pixels: &[u8]| -> [i32; 4] {
             let at = (32 * 64 + 32) * 4;
             std::array::from_fn(|i| pixels.get(at + i).map_or(-1, |v| i32::from(*v)))
@@ -4219,7 +4243,7 @@ mod glass_tests {
         let (adapter, device, queue) = crate::open_headless().expect("software adapter required for the startup check");
         let depth = crate::depth_format(&device, true);
         for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Bgra8UnormSrgb] {
-            let window = GpuTarget { format, depth: None, samples: 1, tess: false };
+            let window = GpuTarget { format, depth: None, samples: 1, tess: false, oit: false };
             for samples in [1, 4] {
                 if ![format, depth].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)) {
                     continue;

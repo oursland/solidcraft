@@ -582,10 +582,7 @@ fn shown_mesh(
         // Refined: faces drawn from the refined plan on the GPU or built from its mesh here.
         return mesh;
     }
-    let doc = &app.session.doc;
-    let opaque =
-        || !body_faded(app, b, active_bodies) && doc.model_body_opacity(b) >= 0.999 && doc.face_colors(b).iter().all(|(_, l)| l.opacity >= 0.999);
-    (app.viewport.gpu.is_some_and(|g| g.tess) && opaque())
+    (app.viewport.gpu.is_some_and(|g| g.tess) && model_plan_class(app, b, active_bodies).is_some())
         .then(|| drawn_plan(app, b, true))
         .flatten()
         // A large body's plan mesh is made on a worker: until then its faces are lit on the
@@ -792,6 +789,42 @@ fn resolve_appearance(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody) -> 
         opacity: s.doc.model_body_opacity(b),
         face_looks: if s.colored_components.is_none() { s.doc.face_colors(b).into_iter().collect() } else { Default::default() },
     }
+}
+
+/// How a body whose faces all share one class may be drawn from its plan: opaque on any GPU
+/// path; faded or see-through only where the renderer blends them order-independently (the
+/// sorted fallback needs the triangles on the CPU). `None`: faces of different classes, which
+/// are built on the CPU. `faces` are the classes [`build_scene`] gives the body's faces.
+fn plan_class(app: &SolveApp, faces: &[crate::gpu::TriClass]) -> Option<crate::gpu::TriClass> {
+    let first = faces.first().copied().unwrap_or(crate::gpu::TriClass::Opaque);
+    if faces.iter().any(|c| *c != first) {
+        return None;
+    }
+    (first == crate::gpu::TriClass::Opaque || app.viewport.gpu.is_some_and(|g| g.oit)).then_some(first)
+}
+
+/// The classes [`build_scene`] gives `b`'s faces: faded outside the active component, else
+/// see-through below full opacity (the body's, or a face's own look).
+fn face_classes(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodies: &Option<Vec<String>>) -> Vec<crate::gpu::TriClass> {
+    if body_faded(app, b, active_bodies) {
+        return vec![crate::gpu::TriClass::Faded; b.body.face_count()];
+    }
+    let resolved = resolve_appearance(app, b);
+    (0..b.body.face_count())
+        .map(|f| {
+            let opacity = resolved.face_looks.get(&f).map_or(resolved.opacity, |l| l.opacity);
+            if opacity < 0.999 { crate::gpu::TriClass::Glass } else { crate::gpu::TriClass::Opaque }
+        })
+        .collect()
+}
+
+/// Whether the model scene draws `b` from its plan's GPU-evaluated triangles (and with which
+/// class), as [`build_scene`] decides: a live preview stands in for none.
+fn model_plan_class(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodies: &Option<Vec<String>>) -> Option<crate::gpu::TriClass> {
+    if app.preview.effective_replaced().contains(&b.name) {
+        return None;
+    }
+    plan_class(app, &face_classes(app, b, active_bodies))
 }
 
 /// A model scene block kept by the viewport: its bytes and the meshes they were built from
@@ -1234,7 +1267,6 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
         // Appearances: the body's opacity, and faces with looks of their own.
         let opacity = resolved.opacity;
         let face_looks = &resolved.face_looks;
-        let opaque = !faded && opacity >= 0.999 && face_looks.values().all(|l| l.opacity >= 0.999);
         let faces = b.body.face_count();
         let mut face_colors = Vec::with_capacity(faces);
         let mut face_classes = Vec::with_capacity(faces);
@@ -1256,10 +1288,11 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
             face_colors.push(slot);
             face_classes.push(class);
         }
-        let planned = drawn_plan(app, b, opaque);
+        let class = plan_class(app, &face_classes);
+        let planned = class.and_then(|class| drawn_plan(app, b, true).map(|plan| (plan, class)));
         let on_gpu = planned.is_some();
-        if let Some(plan) = planned {
-            sc.planned.push(crate::gpu::PlannedBody { plan, face_colors: face_colors.clone() });
+        if let Some((plan, class)) = planned {
+            sc.planned.push(crate::gpu::PlannedBody { plan, face_colors: face_colors.clone(), class });
         }
         // Opaque, faded and see-through bodies alike, in one colour (faces of their own colour
         // are built as before).
@@ -2991,7 +3024,7 @@ fn highlight_plan(
     b: &solidcraft_engine::doc::ModelBody,
     active_bodies: &Option<Vec<String>>,
 ) -> Option<std::sync::Arc<solidcraft_engine::geom::tess::TessPlan>> {
-    drawn_plan(app, b, highlight_opaque(app, b, active_bodies))
+    drawn_plan(app, b, model_plan_class(app, b, active_bodies).is_some())
 }
 
 /// Whether the model draws a whole body opaque on the GPU, rather than building it on the CPU:
@@ -5782,7 +5815,7 @@ mod tests {
             .find_map(|(lies, n)| lies.then_some(n))
         };
         for tess in [false, true] {
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit: false });
             let proj = projection(&app, rect);
             let e = proj.cam.eye().to_f32();
             let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
@@ -5878,7 +5911,7 @@ mod tests {
         const SIZE: u32 = 256;
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
         let mut render = |tess: bool| {
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit: false });
             let scene = build_scene(&app).merged();
             let proj = projection(&app, rect);
             let e = proj.cam.eye().to_f32();
@@ -5937,7 +5970,7 @@ mod tests {
         s.run_script(&solidcraft_engine::sample::script()).unwrap();
         let mut app = SolveApp::new(s, crate::Services::default());
         app.fit_view();
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit: false });
         const SIZE: u32 = 256;
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
         let scene = build_scene(&app).merged();
@@ -5975,7 +6008,7 @@ mod tests {
         s.run_script(&solidcraft_engine::sample::script()).unwrap();
         let mut app = SolveApp::new(s, crate::Services::default());
         app.fit_view();
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         const SIZE: u32 = 256;
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
         let proj = projection(&app, rect);
@@ -6038,7 +6071,7 @@ mod tests {
         app.ui.show_grid = false;
         app.set_origin_shown(false);
         app.ui.ground_shadow = false;
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         const SIZE: u32 = 512;
         const RADIUS: f32 = 45.0;
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
@@ -6081,6 +6114,77 @@ mod tests {
         assert!(step < 0.005, "no copies of the block's outline: a step of {step:.4} between neighbouring columns");
     }
 
+    /// Faded and see-through bodies are drawn from their plans where the renderer blends them
+    /// order-independently, and look as they did built on the CPU: a see-through box beside a
+    /// part faded outside the active component, drawn both ways. Without order-independent
+    /// transparency they stay on the CPU (the sorted fallback needs their triangles). Skipped
+    /// without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn faded_and_see_through_bodies_are_drawn_from_their_plans_with_oit() {
+        let mut s = solidcraft_engine::Session::default();
+        let part = s.execute("component.create", &json!({"name": "Part"})).unwrap()["component"].as_u64().unwrap();
+        s.execute("solid.box", &json!({"length": 30, "width": 30, "height": 30, "corner": [0, 0, 0], "operation": "new", "body_name": "Glass"}))
+            .unwrap();
+        s.execute("appearance.assign", &json!({"bodies": ["Glass"], "color": "#3366cc", "opacity": 0.5})).unwrap();
+        s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 20, "corner": [40, 0, 0], "operation": "new", "body_name": "Inside"}))
+            .unwrap();
+        s.execute("component.activate", &json!({"component": 0})).unwrap();
+        s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 20, "corner": [0, 40, 0], "operation": "new", "body_name": "Faded"}))
+            .unwrap();
+        s.execute("component.activate", &json!({"component": part})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.ui.ground_shadow = false;
+        app.fit_view();
+        const SIZE: u32 = 192;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let target =
+            |tess: bool, oit: bool| Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit });
+        let classes = |scene: &GpuScene| {
+            let mut c: Vec<_> = scene.planned.iter().map(|b| format!("{:?}", b.class)).collect();
+            c.sort();
+            c
+        };
+        app.viewport.gpu = target(true, false);
+        assert_eq!(classes(&build_scene(&app)), ["Opaque"], "without OIT only the opaque body is drawn from its plan");
+        app.viewport.gpu = target(true, true);
+        let planned = build_scene(&app);
+        assert_eq!(classes(&planned), ["Faded", "Glass", "Opaque"], "with OIT every body is");
+        let built: usize = planned.blocks.iter().map(|b| b.bytes.vertices.len()).sum();
+        assert_eq!(built, 0, "and none is built on the CPU");
+        // Hovered, a faded body drawn from its plan lights through the plan's triangles.
+        let faded = app.session.world_state().bodies.iter().find(|b| b.name.starts_with("Faded")).map(|b| b.name.clone()).unwrap();
+        app.viewport.hover_bodies = vec![faded];
+        assert_eq!(build_highlight(&app).hover_planned.len(), 1, "the faded body's plan is lit");
+        app.viewport.hover_bodies.clear();
+        app.viewport.gpu = target(false, false);
+        let cpu = build_scene(&app);
+        let render = |scene: GpuScene, tess: bool| {
+            let proj = projection(&app, rect);
+            let e = proj.cam.eye().to_f32();
+            let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+            crate::gpu::render_offscreen(
+                scene,
+                None,
+                proj.vp.to_f32(),
+                proj.cam.back().to_f32(),
+                eye,
+                SIZE,
+                tess.then_some(solidcraft_gpu::SHADER),
+                [0.0; 8],
+                crate::gpu::analysis_colors(&Tokens::get().analysis),
+            )
+        };
+        let (Some(from_plans), Some(from_cpu)) = (render(planned, true), render(cpu, false)) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let differ = from_plans.chunks(4).zip(from_cpu.chunks(4)).filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x.abs_diff(*y) > 6)).count();
+        let shown = from_cpu.chunks(4).filter(|p| p[..3] != from_cpu[..3]).count();
+        assert!(shown > 2000, "the bodies are in view ({shown} px)");
+        assert!(differ * 100 < shown, "{differ} of {shown} px differ between the plan and CPU pictures");
+    }
+
     /// A hovered face lights solidly over a body drawn from its display plan on the GPU: the
     /// highlight uses the plan's triangles, not the reference mesh's other triangulation of the
     /// same face, which fought the model at equal depth and shimmered in wedges. Every face of a
@@ -6100,7 +6204,7 @@ mod tests {
         let body = app.session.world_state().bodies[0].clone();
         let faces = body.body.face_count();
         let mut render = |tess: bool, hover: Option<usize>| {
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit: false });
             app.viewport.hover = hover.map(|index| Hit::Face { body: body.name.clone(), index, point: Vec3::ZERO });
             let (scene, highlight) = (build_scene(&app), build_highlight(&app).merged());
             assert_eq!(!scene.planned.is_empty(), tess, "the box is drawn from its plan exactly on the GPU path");
@@ -6249,7 +6353,8 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
         let mut render = |origin: bool| {
             app.set_origin_shown(origin);
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+            app.viewport.gpu =
+                Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
             let (scene, highlight) = (build_scene(&app), build_highlight(&app).merged());
             let proj = projection(&app, rect);
             let e = proj.cam.eye().to_f32();
@@ -6611,7 +6716,7 @@ mod tests {
         let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
         app.ui.ground_shadow = false;
         app.set_origin_shown(false);
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         app.run("component.create", json!({"name":"Part"})).unwrap();
         app.run(command, serde_json::from_str(params).unwrap()).unwrap();
         app.run("occurrence.copy", json!({"component":"Part","translate":[40,0,0]})).unwrap();
@@ -6779,7 +6884,7 @@ mod tests {
         let (w, h, samples) = (3600u32 / scale, 2190u32 / scale, 4u32);
         let depth = solidcraft_gpu::depth_format(&device, true);
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        app.viewport.gpu = Some(GpuTarget { format, depth: Some(depth), samples, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format, depth: Some(depth), samples, tess: false, oit: false });
         app.fit_view();
         let texture = |format, samples| {
             device
@@ -6856,7 +6961,7 @@ mod tests {
             return;
         }
         for (label, scene) in [("own triangles", scene.clone().merged()), ("instanced", scene), ("instanced, levels of detail", lod)] {
-            let mut renderer = crate::gpu::Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples, tess: false }, None);
+            let mut renderer = crate::gpu::Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples, tess: false, oit: false }, None);
             let slot: SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(scene)));
             let none = || std::sync::Arc::new(std::sync::Mutex::new(None));
             let (mut times, mut prepared) = (Vec::new(), Vec::new());
@@ -6958,7 +7063,7 @@ mod tests {
         }];
         doc.add_feature(FeatureKind::MeshImport { file: "grid.stl".into(), meshes }, Some("Grid")).unwrap();
         let mut app = SolveApp::new(solidcraft_engine::Session::new(doc), crate::Services::default());
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         let (mesh, _) = app.session.world_state().bodies[0].mesh_in_place();
         assert!(mesh.triangles.len() >= INSTANCE_ALONE);
         warm_shared_tris(&mesh);
@@ -6995,7 +7100,7 @@ mod tests {
         let mut app = SolveApp::new(solidcraft_engine::Session::new(doc), crate::Services::default());
         app.ui.ground_shadow = false;
         app.set_origin_shown(false);
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         app
     }
 
@@ -7315,7 +7420,8 @@ mod tests {
         let mut app = SolveApp::new(s, crate::Services::default());
         if gpu {
             // The callback is queued by egui; no device is needed to inspect scene updates.
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+            app.viewport.gpu =
+                Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         }
         app
     }
@@ -7873,7 +7979,8 @@ mod tests {
             let mut app = SolveApp::new(s, crate::Services::default());
             app.set_origin_shown(false);
             if gpu {
-                app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+                app.viewport.gpu =
+                    Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
             }
             app.cam.target = Vec3::new(20.0, 15.0, 10.0);
             hover_frame(&mut app, &ctx, vec![]);
@@ -7958,7 +8065,7 @@ mod tests {
         };
         for tess in [true, false] {
             let mut app = cylinder_app();
-            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess, oit: false });
             let body = app.session.world_state().bodies[0].clone();
             let before = build_scene(&app).merged();
             let key = scene_key(&app);
@@ -8093,7 +8200,7 @@ mod tests {
     #[test]
     fn whole_body_highlights_reuse_the_models_own_triangles() {
         let mut app = cylinder_app();
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: true });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: true, oit: false });
         let body = app.session.world_state().bodies[0].clone();
         let plan = body.display_plan().expect("the test body is drawn from a plan");
         app.viewport.hover_bodies = vec![body.name.clone()];
@@ -9628,7 +9735,7 @@ mod tests {
         let mut app = SolveApp::new(s, crate::Services::default());
         app.fit_view();
         app.run("inspect.draft", json!({"pull": [-1, -1, 0]})).unwrap();
-        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
         const SIZE: u32 = 256;
         let proj = projection(&app, Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32)));
         let e = proj.cam.eye().to_f32();

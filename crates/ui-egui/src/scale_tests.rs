@@ -355,8 +355,7 @@ fn assembly_tree_hover_frame_cost() {
         // Keys of their own for each scene: the renderer keeps a scene while its key comes back.
         let base = 1_000_000 * (3 * design as u64 + 1);
         let mut h = assembly(unique, placed);
-        h.app.viewport.gpu =
-            Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: frames.tessellates() });
+        h.app.viewport.gpu = frames.target();
         h.app.fit_view();
         let label = format!("HOVERFRAME unique={unique} placed={placed} tess={}", frames.tessellates());
         println!("{}", hover_rows(&mut h, &mut frames, SIZE, base, &format!("{label} mode=plain")));
@@ -426,7 +425,8 @@ fn whole_body_highlight_cost_from_the_models_own_triangles() {
     let bodies = names.len();
     h.app.viewport.hover_bodies = names;
     let copied = ms(|| drop(crate::viewport::build_highlight(&h.app)));
-    h.app.viewport.gpu = Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: true });
+    h.app.viewport.gpu =
+        Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: true, oit: false });
     let planned = ms(|| drop(crate::viewport::build_highlight(&h.app)));
     println!("HIGHLIGHT bodies={bodies} triangles={triangles} cpu_copy_ms={copied:.2} model_triangles_ms={planned:.2}");
 }
@@ -491,8 +491,7 @@ fn step_file_cost() {
     let _ = h.app.run("select.clear", json!({}));
     const SIZE: u32 = 1024;
     if let Some(mut frames) = crate::gpu::OffscreenFrames::new(SIZE, true) {
-        h.app.viewport.gpu =
-            Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: frames.tessellates() });
+        h.app.viewport.gpu = frames.target();
         h.app.fit_view();
         let model: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(crate::viewport::build_scene(&h.app))));
         let highlight: crate::gpu::SceneSlot = std::sync::Arc::new(std::sync::Mutex::new(None));

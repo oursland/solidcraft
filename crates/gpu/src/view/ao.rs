@@ -170,7 +170,7 @@ impl Resources {
                 }
             }
             pass.set_pipeline(&self.planned_pipeline);
-            for draw in &batch.planned {
+            for draw in batch.planned.iter().filter(|d| d.class == super::TriClass::Opaque) {
                 pass.set_vertex_buffer(0, draw.mesh.vertices.slice(..));
                 pass.set_vertex_buffer(1, draw.colors.slice(..));
                 pass.set_index_buffer(draw.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);

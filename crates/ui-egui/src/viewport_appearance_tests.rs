@@ -154,7 +154,8 @@ fn selection_does_not_rebuild_the_model_scene() {
     h.app.ui.ground_shadow = false;
     h.app.set_origin_shown(false);
     h.app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
-    h.app.viewport.gpu = Some(super::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+    h.app.viewport.gpu =
+        Some(super::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
     h.frame();
     let key = h.app.viewport.key;
     let highlight = h.app.viewport.hl_key;
@@ -238,7 +239,8 @@ fn appearance_edits_upload_palette_rows_only() {
     let mut app = SolveApp::new(Session::default(), Services::default());
     app.ui.ground_shadow = false;
     app.set_origin_shown(false);
-    app.viewport.gpu = Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+    app.viewport.gpu =
+        Some(crate::gpu::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
     app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
     app.fit_view();
     let name = app.session.world_state().bodies[0].name.clone();
@@ -274,7 +276,8 @@ fn theme_switches_refresh_cached_viewport_colours_without_remeshing() {
     h.app.ui.ground_shadow = false;
     h.app.set_origin_shown(false);
     h.app.run("solid.box", json!({"length": 20, "width": 15, "height": 10})).unwrap();
-    h.app.viewport.gpu = Some(super::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false });
+    h.app.viewport.gpu =
+        Some(super::GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false });
     let body = h.app.session.world_state().bodies[0].name.clone();
     h.app.session.selection = vec![solidcraft_engine::Sel::Body { name: body.clone() }];
     h.frame();
