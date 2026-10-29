@@ -384,6 +384,13 @@ fn revolutions_and_extruded_circles_become_their_analytic_surfaces() {
             _ => false,
         };
         assert!(want, "{name}: {:?}", face.surface);
+        if kind == "plane" {
+            // The box round the annulus' sector from 0.3 rad through three quarter turns, radii 1
+            // to 3: its corners where the sector reaches x = -3, y = -3 and y = 3.
+            let want = [[-3.0, 3.0 * 0.3f64.cos()], [-3.0, 3.0]];
+            let close = face.domain.iter().flatten().zip(want.iter().flatten()).all(|(a, b)| (a - b).abs() < 1e-9);
+            assert!(close, "{name}: range {:?}, the sector's box {want:?}", face.domain);
+        }
         let (old, new) = (SurfaceEval::new(surface).unwrap(), SurfaceEval::new(&face.surface).unwrap());
         // A plane's range is the box round the face, not all of it on the revolution.
         let both = if kind == "plane" { 1 } else { 2 };
