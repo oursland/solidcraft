@@ -318,3 +318,82 @@ fn a_patch_across_an_extruded_circles_seam_is_its_exact_cylinder() {
     let start = (-half).sin_cos();
     assert!((frame.x_axis[0] - start.1).abs() <= 1e-12 && (frame.x_axis[1] - start.0).abs() <= 1e-12, "x {:?}", frame.x_axis);
 }
+
+/// Every revolution truck makes for an analytic surface comes to SMLib as that surface, placed
+/// off the world's axes and with the profile along either parameter, and a rational spline that
+/// is an extruded circle as a cylinder: points of the record's surface over its domain lie on
+/// the analytic surface, and the analytic surface over its range (but a plane's, the box round
+/// the face) on the record's.
+#[test]
+fn revolutions_and_extruded_circles_become_their_analytic_surfaces() {
+    use solidcraft_geom::brep::{Frame, eval::SurfaceEval, form};
+    use std::f64::consts::{FRAC_PI_2, TAU};
+    let line = |a: [f64; 3], z: [f64; 3]| (Curve::Line { start: a, end: z }, [0.0, 1.0]);
+    let xz = |o: [f64; 3]| Frame { origin: o, x_axis: [1.0, 0.0, 0.0], y_axis: [0.0, 0.0, 1.0] };
+    let arc = |o: [f64; 3], r: f64, t: [f64; 2]| form::curve(&Curve::Circle { frame: xz(o), radius: r }, t).unwrap();
+    let profiles: Vec<(&str, (Curve, [f64; 2]))> = vec![
+        ("plane", line([1.0, 0.0, 0.0], [3.0, 0.0, 0.0])),
+        ("cylinder", line([2.0, 0.0, 0.0], [2.0, 0.0, 4.0])),
+        ("cone", line([1.0, 0.0, 0.0], [3.0, 0.0, 4.0])),
+        ("sphere", arc([0.0; 3], 2.0, [-FRAC_PI_2 + 0.2, FRAC_PI_2 - 0.2])),
+        ("torus", arc([5.0, 0.0, 0.0], 1.0, [-1.0, 2.0])),
+    ];
+    // Turned about (1, 1, 1) by 120° (x → y → z) and moved.
+    let placements = [
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        [[0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [3.0, -1.0, 2.0, 1.0]],
+    ];
+    let single = |surface: Surface, domain: [[f64; 2]; 2]| Record {
+        version: b::VERSION,
+        tolerance: 1e-6,
+        regions: Vec::new(),
+        shells: Vec::new(),
+        faces: vec![Face { surface, nurbs: None, domain, loops: Vec::new() }],
+        edges: Vec::new(),
+        vertices: Vec::new(),
+    };
+    let mut cases: Vec<(String, Surface, [[f64; 2]; 2])> = Vec::new();
+    for (name, (profile, t)) in &profiles {
+        for matrix in placements {
+            for forward in [true, false] {
+                let surface =
+                    Surface::PlacedRevolution { profile: Box::new(profile.clone()), origin: [0.0; 3], axis: [0.0, 0.0, 1.0], matrix, forward };
+                let angles = [0.3, 0.3 + 0.75 * TAU];
+                let domain = if forward { [*t, angles] } else { [angles, *t] };
+                cases.push((format!("{name}, forward {forward}, placed {:?}", matrix[3]), surface, domain));
+            }
+        }
+    }
+    let frame = Frame { origin: [1.0, 2.0, 3.0], x_axis: [0.0, 1.0, 0.0], y_axis: [0.0, 0.0, 1.0] };
+    let (extruded, range) = form::surface(&Surface::Cylinder { frame, radius: 2.5 }, [[0.2, 2.0], [-1.0, 4.0]]).unwrap();
+    assert!(matches!(extruded, Surface::RationalSpline { .. }));
+    cases.push(("extruded circle".into(), extruded, range));
+    for (name, surface, domain) in &cases {
+        let record = single(surface.clone(), *domain);
+        let made = analytic::analytic(&record).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let face = &made.faces[0];
+        let kind = name.split(',').next().unwrap();
+        let want = match kind {
+            "plane" => matches!(face.surface, Surface::Plane { .. }),
+            "cylinder" | "extruded circle" => matches!(face.surface, Surface::Cylinder { .. }),
+            "cone" => matches!(face.surface, Surface::Cone { .. }),
+            "sphere" => matches!(face.surface, Surface::Sphere { .. }),
+            "torus" => matches!(face.surface, Surface::Torus { .. }),
+            _ => false,
+        };
+        assert!(want, "{name}: {:?}", face.surface);
+        let (old, new) = (SurfaceEval::new(surface).unwrap(), SurfaceEval::new(&face.surface).unwrap());
+        // A plane's range is the box round the face, not all of it on the revolution.
+        let both = if kind == "plane" { 1 } else { 2 };
+        for ((from, d), onto) in [((&old, *domain), &new), ((&new, face.domain), &old)].into_iter().take(both) {
+            let [[u0, u1], [v0, v1]] = d;
+            for j in 0..=6 {
+                for k in 0..=6 {
+                    let p = from.point([u0 + (u1 - u0) * f64::from(j) / 6.0, v0 + (v1 - v0) * f64::from(k) / 6.0]).unwrap();
+                    let gap = onto.project(p, None, 1e-3).and_then(|uv| onto.point(uv)).map_or(f64::INFINITY, |q| q.dist(p));
+                    assert!(gap < 1e-8, "{name}: {p:?} is {gap} off the other surface ({:?} on {:?})", face.surface, face.domain);
+                }
+            }
+        }
+    }
+}
