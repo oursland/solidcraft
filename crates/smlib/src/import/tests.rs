@@ -319,6 +319,32 @@ fn a_patch_across_an_extruded_circles_seam_is_its_exact_cylinder() {
     assert!((frame.x_axis[0] - start.1).abs() <= 1e-12 && (frame.x_axis[1] - start.0).abs() <= 1e-12, "x {:?}", frame.x_axis);
 }
 
+/// A one-face record of `surface` trimmed by the rectangle `domain` (its four sides as pcurves,
+/// on placeholder edges): what the import of a spline face reads its range from.
+fn rectangle(surface: Surface, domain: [[f64; 2]; 2]) -> Record {
+    let [[u0, u1], [v0, v1]] = domain;
+    let corners = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+    let edges: Vec<OrientedEdge> = (0..4)
+        .map(|k| OrientedEdge {
+            edge: k as u32,
+            forward: true,
+            pcurve: Curve2::Spline { knots: vec![0.0, 0.0, 1.0, 1.0], points: vec![corners[k], corners[(k + 1) % 4]] },
+        })
+        .collect();
+    let line = Curve::Line { start: [0.0; 3], end: [1.0, 0.0, 0.0] };
+    Record {
+        version: b::VERSION,
+        tolerance: 1e-6,
+        regions: Vec::new(),
+        shells: Vec::new(),
+        faces: vec![Face { surface, nurbs: None, domain, loops: vec![Loop::Edges { edges }] }],
+        edges: (0..4)
+            .map(|_| Edge { nurbs: None, curve: line.clone(), interval: [0.0, 1.0], vertices: [0, 0], tolerance: 1e-6, uses: Vec::new() })
+            .collect(),
+        vertices: Vec::new(),
+    }
+}
+
 /// Every revolution truck makes for an analytic surface comes to SMLib as that surface, placed
 /// off the world's axes and with the profile along either parameter, and a rational spline that
 /// is an extruded circle as a cylinder: points of the record's surface over its domain lie on
@@ -371,7 +397,9 @@ fn revolutions_and_extruded_circles_become_their_analytic_surfaces() {
     assert!(matches!(extruded, Surface::RationalSpline { .. }));
     cases.push(("extruded circle".into(), extruded, range));
     for (name, surface, domain) in &cases {
-        let record = single(surface.clone(), *domain);
+        // A spline face's range comes from its trims; a revolution's from its domain.
+        let record =
+            if matches!(surface, Surface::RationalSpline { .. }) { rectangle(surface.clone(), *domain) } else { single(surface.clone(), *domain) };
         let made = analytic::analytic(&record).unwrap_or_else(|e| panic!("{name}: {e}"));
         let face = &made.faces[0];
         let kind = name.split(',').next().unwrap();
@@ -460,16 +488,7 @@ fn revolutions_with_no_analytic_surface_stay_revolutions() {
     }
     for (name, net) in [("sheared", sheared), ("bent", bent)] {
         let surface = Surface::RationalSpline { u_knots: u_knots.clone(), v_knots: v_knots.clone(), homogeneous: net };
-        let face = Face { surface, nurbs: None, domain: range, loops: Vec::new() };
-        let record = Record {
-            version: b::VERSION,
-            tolerance: 1e-6,
-            regions: Vec::new(),
-            shells: Vec::new(),
-            faces: vec![face],
-            edges: Vec::new(),
-            vertices: Vec::new(),
-        };
+        let record = rectangle(surface, range);
         let made = analytic::analytic(&record).unwrap();
         assert!(matches!(made.faces[0].surface, Surface::RationalSpline { .. }), "{name}: {:?}", made.faces[0].surface);
     }
