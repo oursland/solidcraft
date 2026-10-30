@@ -288,12 +288,14 @@ impl FileLoad {
                 _ => std::path::Path::new(&request.path).file_name().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
             },
             steps: None,
+            percent: false,
             queued: true,
             cancelled: false,
             waiting: false,
         };
         let running = self.running.as_ref().map(|r| FileOperation {
             steps: steps(r),
+            percent: r.request.kind != Kind::UpdateLinks && work(r).is_some_and(|(stage, _, _)| crate::operations::bytes_stage(stage)),
             queued: false,
             cancelled: r.cancelled(),
             waiting: r.ready.as_ref().is_some_and(Result::is_ok),
@@ -310,6 +312,8 @@ pub(crate) struct FileOperation {
     pub command: &'static str,
     pub name: String,
     pub steps: Option<(usize, usize)>,
+    /// The steps are bytes (the file being read).
+    pub percent: bool,
     pub queued: bool,
     pub cancelled: bool,
     /// Done, and waiting to land ([`Land::Wait`]).
@@ -318,6 +322,12 @@ pub(crate) struct FileOperation {
 
 /// How far a running request is: the long work inside a feature (a large STEP file read), the
 /// linked designs read again, or the features rebuilt; `None` when that is not known yet.
+/// The long work inside one feature the running request is in (a large STEP file read), if any.
+fn work(r: &Running) -> Option<(&'static str, usize, usize)> {
+    let phase = r.phase.load(Ordering::Relaxed);
+    r.progress.work().filter(|(_, d, t)| r.request.kind == Kind::ExportDxf || (phase == 0 && d < t))
+}
+
 fn steps(r: &Running) -> Option<(usize, usize)> {
     if r.request.kind == Kind::UpdateLinks
         && let Some((_, i, n)) = r.progress.item()
@@ -325,7 +335,7 @@ fn steps(r: &Running) -> Option<(usize, usize)> {
         return Some((i, n));
     }
     let phase = r.phase.load(Ordering::Relaxed);
-    if let Some((_, d, t)) = r.progress.work().filter(|(_, d, t)| r.request.kind == Kind::ExportDxf || (phase == 0 && d < t)) {
+    if let Some((_, d, t)) = work(r) {
         return Some((d, t));
     }
     let (done, total) = r.progress.features();
