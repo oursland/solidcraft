@@ -85,6 +85,13 @@ pub fn is_design_path(path: &str) -> bool {
     std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| is_design_ext(e) || e.eq_ignore_ascii_case("json"))
 }
 
+/// Whether these bytes are an OpenPGP message: an encrypted design (see `docs/formats/`). A
+/// design container starts as a ZIP (`PK`), a design JSON starts as `{`; an OpenPGP message is
+/// armored (`-----BEGIN PGP MESSAGE-----`) or a binary packet whose first byte has bit 7 set.
+pub fn is_openpgp_encrypted(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"-----BEGIN PGP MESSAGE-----") || (bytes.first().is_some_and(|byte| byte & 0x80 != 0) && !bytes.starts_with(b"PK\x03\x04"))
+}
+
 /// Is this a design container file (`.sc` or a legacy extension, not plain JSON), any case?
 pub fn is_design_container_path(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(is_design_ext)
@@ -944,6 +951,9 @@ pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<V
 pub fn read_design(bytes: &[u8]) -> Result<Document> {
     let _span = solidcraft_profile::span("io", "read_design");
     limits::check(limits::Kind::Design, bytes.len() as u64).map_err(|e| IoError::Invalid(format!("design {e}")))?;
+    if is_openpgp_encrypted(bytes) {
+        return Err(IoError::Invalid("this design is encrypted: open it in the desktop app with GnuPG (the browser cannot decrypt it)".into()));
+    }
     if is_design_container(bytes) {
         return design::read(bytes);
     }
@@ -1626,5 +1636,21 @@ mod tests {
         let mut xml = String::new();
         zip.by_name("3D/3dmodel.model").unwrap().read_to_string(&mut xml).unwrap();
         assert!(!xml.contains("ft:"));
+    }
+}
+
+#[cfg(test)]
+mod openpgp_encrypted_tests {
+    use super::is_openpgp_encrypted;
+
+    #[test]
+    fn recognizes_an_encrypted_design_and_not_a_container_or_json() {
+        assert!(is_openpgp_encrypted(b"-----BEGIN PGP MESSAGE-----\n"));
+        // The first byte of a binary OpenPGP message has bit 7 set (a public-key encrypted
+        // session key packet here).
+        assert!(is_openpgp_encrypted(&[0x84, 0x5e, 0x03, 0xdf]));
+        assert!(!is_openpgp_encrypted(b"PK\x03\x04rest of a container"));
+        assert!(!is_openpgp_encrypted(b"{\"format\":\"solidcraft/55\"}"));
+        assert!(!is_openpgp_encrypted(b""));
     }
 }
