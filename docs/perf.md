@@ -641,6 +641,28 @@ and paint nothing (no text layout, icons or eye/fold buttons), so the cost follo
 screen rather than the rows in the tree. Scrolling, Find in Browser and drag and drop still see
 every row's place.
 
+## Whole-body highlights in Wireframe: faces evaluated from plans (2026-11-12)
+
+In Wireframe the model draws no faces, so a whole hovered or selected body's faces could not be
+drawn again from the model's own triangles, as they are when the view shades: the highlight
+copied every triangle of every lit body on the CPU and uploaded it, at each change of the
+hovered row. Now the highlight hands the GPU each body's display plan and draws the triangles
+the GPU evaluates from it (the highlight scene's own `planned` bodies), as the model does when
+it shades. Without GPU evaluation the triangles are copied as before.
+
+Measured on the 561-body STEP printer assembly (2.8 million triangles), NVIDIA GB10, 3774 × 2094
+viewport, release build, Wireframe: the pointer moved on and off the assembly's Browser row 20
+times through the control channel, `SOLIDCRAFT_PROFILE_FRAMES=1` reporting each highlight build.
+
+| | highlight build | triangle bytes built and uploaded |
+|---|---|---|
+| before (`main`) | 178–190 ms, each a frame over 180 ms | 239 MB |
+| after | 21–36 ms (median 22) | 0 |
+
+The GPU evaluates the 561 plans in under 5 ms (the longest GPU workload in an `nsys` trace of
+the same hovers). The remaining CPU time is the copy of the bodies' edges, which drawing the
+model's own edge lines again removes as well.
+
 # Recompute performance
 
 `solidcraft-cli bench-edit <script> <param> "(<old>) * 1.02"` builds a design from its script
