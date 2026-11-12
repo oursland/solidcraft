@@ -19,6 +19,15 @@
     "ui.open_signature_unsupported": "This signature needs a newer SolidCraft",
     "ui.open_signature_unverified": "Signed; not checked in this session",
     "cmd.file.verify": "Verify Signature",
-    "cmd.file.gpg_keys": "Signing Keys"
+    "cmd.file.gpg_keys": "Signing Keys",
+    "prefs.security.encrypt_saved": "Encrypt saved designs with GnuPG",
+    "prefs.security.encrypt_saved_help": "Each save is encrypted with GnuPG, so only the chosen recipients can read it. A YubiKey smartcard decrypts it on open and asks for its PIN. Desktop only.",
+    "prefs.security.encryption_recipients": "Recipients",
+    "prefs.security.encryption_recipients_hint": "Empty: your own GnuPG default key",
+    "prefs.security.encryption_recipients_help": "GnuPG key ids, fingerprints or user ids, separated by commas. Empty encrypts to your own GnuPG default key, so your YubiKey decrypts it.",
+    "ui.design_saved_encrypted": "Saved {path}, encrypted",
+    "ui.design_saved_signed_encrypted": "Saved {path}, signed with {key} and encrypted",
+    "ui.open_encrypted": "Encrypted design, unlocked with GnuPG",
+    "ui.encrypted_design": "Encrypted with GnuPG"
   }
 }

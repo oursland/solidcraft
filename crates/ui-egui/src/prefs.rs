@@ -994,6 +994,11 @@ preference_settings! {
     signing_key: String = String::new(), PAGE_SECURITY;
     /// Verify a design's signature when it opens. Off: opening reads no payload twice.
     verify_opened_designs: bool = false, PAGE_SECURITY => check_id_help("prefs.security.verify_opened", "prefs.security.verify_opened_help");
+    /// Encrypt every saved design with GnuPG. Desktop only; a smartcard key decrypts it on open.
+    encrypt_saved_designs: bool = false, PAGE_SECURITY => check_id_help("prefs.security.encrypt_saved", "prefs.security.encrypt_saved_help");
+    /// Who can decrypt a saved design: GnuPG key ids, fingerprints or user ids, comma-separated.
+    /// Empty: the user's own GnuPG default key.
+    encryption_recipients: String = String::new(), PAGE_SECURITY;
     /// With a dialog open, typing the first letter of a button's label presses it: O for OK,
     /// C for Cancel (#9841). Off by default: typing does nothing to the buttons, as before.
     /// A letter that fits two buttons does nothing, and a focused text field keeps the keystroke.
@@ -6682,6 +6687,8 @@ mod tests {
             ("sign_saved_designs", json!(true), PAGE_SECURITY),
             ("signing_key", json!("0123456789ABCDEF0123456789ABCDEF01234567"), PAGE_SECURITY),
             ("verify_opened_designs", json!(true), PAGE_SECURITY),
+            ("encrypt_saved_designs", json!(true), PAGE_SECURITY),
+            ("encryption_recipients", json!("0123456789ABCDEF"), PAGE_SECURITY),
         ];
         let defaults = serde_json::to_value(Prefs::default()).unwrap();
         for (field, value, owner) in fields {

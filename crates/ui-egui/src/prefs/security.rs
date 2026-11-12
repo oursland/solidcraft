@@ -20,7 +20,16 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             setting::verify_opened_designs(app, ui);
         });
         ui_kit::settings_section(ui, "encryption", app.tr("prefs.security.encryption"), |ui| {
-            ui_kit::settings_inline_note(ui, app.tr("prefs.security.encryption_note"));
+            setting::encrypt_saved_designs(app, ui);
+            ui_kit::settings_form(ui, labels, |ui| {
+                let tip = app.tr("prefs.security.encryption_recipients_help").to_string();
+                ui_kit::settings_row_help(ui, app.tr("prefs.security.encryption_recipients"), &tip, |ui| {
+                    let hint = app.tr("prefs.security.encryption_recipients_hint").to_string();
+                    let (_, response) = ui_kit::text_field_reserving(ui, &mut app.preferences.encryption_recipients, &hint, 0.0);
+                    crate::scenario::publish_target("prefs:encryption_recipients", response.rect);
+                    response
+                });
+            });
         });
     });
 }

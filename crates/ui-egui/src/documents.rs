@@ -1144,11 +1144,18 @@ fn tab_security(app: &SolveApp) -> Vec<Option<String>> {
     open_sessions(app)
         .into_iter()
         .map(|session| {
-            if let Some(report) = &session.provenance {
-                return Some(signature_line(report));
+            let signature = if let Some(report) = &session.provenance {
+                Some(signature_line(report))
+            } else {
+                let signed = session.provenance_chain.as_ref().is_some_and(|chain| !chain.records.is_empty());
+                signed.then(|| solidcraft_ui_text::tr("ui.open_signature_unverified").to_string())
+            };
+            let encryption = session.encrypted.then(|| solidcraft_ui_text::tr("ui.encrypted_design").to_string());
+            match (encryption, signature) {
+                (Some(encryption), Some(signature)) => Some(format!("{encryption}\n{signature}")),
+                (Some(encryption), None) => Some(encryption),
+                (None, signature) => signature,
             }
-            let signed = session.provenance_chain.as_ref().is_some_and(|chain| !chain.records.is_empty());
-            signed.then(|| solidcraft_ui_text::tr("ui.open_signature_unverified").to_string())
         })
         .collect()
 }

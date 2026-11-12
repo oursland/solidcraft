@@ -1770,8 +1770,18 @@ impl SolveApp {
                     if matches!(id, "file.save" | "file.save_as") {
                         home::remember_session(&mut self.home, &self.session);
                         // Say where it went, as an export does (#8693), and who signed it.
-                        let saved = match v.get("signature").and_then(Value::as_object) {
-                            Some(signature) => {
+                        let signature = v.get("signature").and_then(Value::as_object);
+                        let encrypted = v.get("encryption").is_some();
+                        let saved = match (signature, encrypted) {
+                            (Some(signature), true) => {
+                                let key = signature
+                                    .get("user_id")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| signature.get("fingerprint").and_then(Value::as_str))
+                                    .unwrap_or("");
+                                self.tr("ui.design_saved_signed_encrypted").replace("{path}", &p).replace("{key}", key)
+                            }
+                            (Some(signature), false) => {
                                 let key = signature
                                     .get("user_id")
                                     .and_then(Value::as_str)
@@ -1779,7 +1789,8 @@ impl SolveApp {
                                     .unwrap_or("");
                                 self.tr("ui.design_saved_signed").replace("{path}", &p).replace("{key}", key)
                             }
-                            None => self.tr("ui.design_saved").replace("{path}", &p),
+                            (None, true) => self.tr("ui.design_saved_encrypted").replace("{path}", &p),
+                            (None, false) => self.tr("ui.design_saved").replace("{path}", &p),
                         };
                         self.set_status(saved, false);
                     }
@@ -2924,6 +2935,25 @@ impl SolveApp {
         self.set_status(text, status == "invalid");
     }
 
+    /// Say that an opened design was encrypted and unlocked (a `doc.open` on an OpenPGP file).
+    pub(crate) fn say_encryption(&mut self, result: &serde_json::Value) {
+        if let Some(encryption) = result.get("encryption") {
+            let recipients: Vec<&str> = encryption
+                .get("recipients")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            let text = if recipients.is_empty() {
+                solidcraft_ui_text::tr("ui.open_encrypted").to_string()
+            } else {
+                format!("{} ({})", solidcraft_ui_text::tr("ui.open_encrypted"), recipients.join(", "))
+            };
+            self.set_status(text, false);
+        }
+    }
+
     /// Open the design (or file) at `path` here and now: it is read and evaluated before this
     /// returns, which blocks the thread for a large design. The app opens through
     /// [`Self::open_path_async`] or [`Self::open_path_answered`] (progress and Cancel, #10198);
@@ -2956,6 +2986,7 @@ impl SolveApp {
             stand_up::offer(self, path, &[], Some(&r));
             self.say_newer_file();
             self.say_signature(&r);
+            self.say_encryption(&r);
         }
     }
 

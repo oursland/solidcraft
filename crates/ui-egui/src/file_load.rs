@@ -1659,6 +1659,7 @@ fn land_now(app: &mut SolveApp, mut running: Running) {
                     if !request.insert() {
                         app.say_newer_file();
                         app.say_signature(&made.result);
+                        app.say_encryption(&made.result);
                     }
                     if let Some(note) = &request.note {
                         app.set_status(note.clone(), false);

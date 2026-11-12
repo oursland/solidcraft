@@ -563,6 +563,13 @@ pub(crate) fn provenance_params(app: &SolveApp) -> Value {
             params["signing_key"] = json!(key);
         }
     }
+    if app.preferences.encrypt_saved_designs {
+        params["encrypt"] = json!(true);
+        let recipients = app.preferences.encryption_recipients.trim();
+        if !recipients.is_empty() {
+            params["encryption_recipients"] = json!(recipients);
+        }
+    }
     params
 }
 
