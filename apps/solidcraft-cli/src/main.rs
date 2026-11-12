@@ -339,6 +339,18 @@ fn read_session(
         return Ok(s);
     }
     let bytes = solidcraft_engine::io::limits::read(path, solidcraft_engine::io::limits::Kind::Design).map_err(|e| format!("{path}: {e}"))?;
+    if solidcraft_engine::io::is_openpgp_encrypted(&bytes) {
+        // An encrypted design: GnuPG decrypts it (a smartcard key asks for its PIN), then it is
+        // the same design a plain container holds.
+        let gpg = solidcraft_engine::gpg::Gpg::find().ok_or_else(|| format!("{path}: encrypted designs need GnuPG"))?;
+        let decrypted = gpg.decrypt(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        let doc = solidcraft_engine::io::read_design(&decrypted.bytes).map_err(|e| format!("{path}: {e}"))?;
+        let mut session = Session::opened_at_validating(doc, None, Some(path), validation);
+        session.param_check = check;
+        session.encrypted = true;
+        session.encryption_recipients = decrypted.recipients;
+        return Ok(session);
+    }
     if solidcraft_engine::io::is_design_container(&bytes) {
         let doc = solidcraft_engine::io::read_design(&bytes).map_err(|e| format!("{path}: {e}"))?;
         let mut session = Session::opened_at_validating(doc, None, Some(path), validation);

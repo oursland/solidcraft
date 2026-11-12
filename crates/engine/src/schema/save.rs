@@ -82,6 +82,14 @@ pub struct SaveParams {
     /// default signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
+    /// Encrypt the saved design with GnuPG. Default: keep an encrypted design encrypted; a plain
+    /// design stays plain unless this is true. Desktop only.
+    #[serde(default)]
+    pub encrypt: Option<bool>,
+    /// Who can decrypt the saved design: GnuPG key ids, fingerprints or user ids, separated by
+    /// commas. Default, or blank: the user's own GnuPG default key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_recipients: Option<String>,
 }
 
 /// Write the design to a new file (a design file name, `.sc` as a rule) and make that file the
@@ -123,6 +131,14 @@ pub struct SaveAsParams {
     /// default signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
+    /// Encrypt the saved design with GnuPG. Default: keep an encrypted design encrypted; a plain
+    /// design stays plain unless this is true. Desktop only.
+    #[serde(default)]
+    pub encrypt: Option<bool>,
+    /// Who can decrypt the saved design: GnuPG key ids, fingerprints or user ids, separated by
+    /// commas. Default, or blank: the user's own GnuPG default key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_recipients: Option<String>,
 }
 
 /// What a signed save put in the file.
@@ -135,6 +151,15 @@ pub struct SignedSave {
     /// The primary user id of the signing key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+}
+
+/// What an encrypted save put in the file.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EncryptedSave {
+    /// The scheme: `gpg` for an OpenPGP message made by GnuPG.
+    pub method: String,
+    /// The GnuPG recipient key ids the design was encrypted to.
+    pub recipients: Vec<String>,
 }
 
 /// What `file.save` and `file.save_as` return.
@@ -161,6 +186,9 @@ pub struct SaveResult {
     /// With `sign: true`: who signed the file that was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<SignedSave>,
+    /// When the file was written encrypted: who can decrypt it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptedSave>,
 }
 
 #[cfg(test)]

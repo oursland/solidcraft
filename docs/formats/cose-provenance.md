@@ -256,6 +256,7 @@ GnuPG integration is in `crates/engine/src/gpg.rs` (desktop only): key listing, 
 commands are `file.save`/`file.save_as` (`sign`, `signing_key`), `file.verify` and
 `file.gpg_keys`. Preferences (`prefs.security.*`) are off by default.
 
-Encryption is not part of this increment. It needs an encrypted file or an encrypted copy with an
-explicit open path (including recovery), and is designed together with its indicator in the next
-step.
+Encryption is a separate, additive format: an encrypted design is an OpenPGP message whose
+plaintext is this container, so a save can sign and then encrypt. See
+[encrypted design files](design-encryption.md); verification of a signed, encrypted design works
+after decryption (`file.verify` does that itself).

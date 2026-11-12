@@ -49,6 +49,11 @@ groups), `legacy_extension_and_format_tag_still_open` (CLI, `run_results.rs`),
 
 ## 2. The `solvecraft/N` format tag
 
+A design saved with encryption is not a ZIP container but an OpenPGP message whose plaintext is
+the container described above. It keeps its `.sc` name; a build that predates encrypted designs
+reports it as unreadable rather than opening it. See
+[encrypted design files](formats/design-encryption.md).
+
 Designs record their format as `"format": "solidcraft/N"`. Files saved by builds up to 0.5 say
 `"format": "solvecraft/N"`; `crates/doc/src/format.rs` (`version_of`) reads both prefixes and
 upgrades them as usual (the file is re-tagged `solidcraft/N` when saved).

@@ -15,6 +15,9 @@ use std::process::{Command, Stdio};
 /// A GnuPG installation SolidCraft can run.
 pub struct Gpg {
     program: PathBuf,
+    /// `GNUPGHOME` for this instance (`None`: GnuPG's own). Tests use a throwaway home so they
+    /// never touch the user's keyring.
+    home: Option<PathBuf>,
 }
 
 /// A secret key GnuPG can sign with, as `file.gpg_keys` lists it.
@@ -49,7 +52,7 @@ impl Gpg {
                 continue;
             };
             if status.success() {
-                return Some(Gpg { program });
+                return Some(Gpg { program, home: None });
             }
         }
         None
@@ -104,6 +107,79 @@ impl Gpg {
         Ok(GpgSignature { signature, key, signing_fingerprint, user_id })
     }
 
+    /// Encrypt `plaintext` to `recipients` (GnuPG key ids, fingerprints or user ids). With no
+    /// recipients, GnuPG's default recipient (the user's own key) is used. Returns the binary
+    /// OpenPGP message and the recipient key ids GnuPG used.
+    pub fn encrypt(&self, recipients: &[String], plaintext: &[u8]) -> Result<Encrypted, String> {
+        let dir = TempDir::new()?;
+        let plain_path = dir.path().join("design.bin");
+        let cipher_path = dir.path().join("design.gpg");
+        write_private(&plain_path, plaintext)?;
+        let mut arguments: Vec<String> = vec![
+            "--batch".into(),
+            "--no-tty".into(),
+            "--yes".into(),
+            "--status-fd".into(),
+            "1".into(),
+            "--logger-fd".into(),
+            "2".into(),
+            "--encrypt".into(),
+            "--output".into(),
+            cipher_path.to_string_lossy().into_owned(),
+        ];
+        if recipients.is_empty() {
+            arguments.push("--default-recipient-self".into());
+        } else {
+            for recipient in recipients {
+                arguments.push("--recipient".into());
+                arguments.push(recipient.clone());
+            }
+        }
+        arguments.push(plain_path.to_string_lossy().into_owned());
+        let output = self.run(arguments)?;
+        if !output.status.success() {
+            return Err(encryption_error(&output));
+        }
+        let bytes = std::fs::read(&cipher_path).map_err(|error| format!("the GnuPG message could not be read: {error}"))?;
+        if bytes.is_empty() {
+            return Err("GnuPG reported success but wrote no encrypted design".to_owned());
+        }
+        // Encryption status does not name recipients; its packets do (no PIN, no decryption).
+        let listed = self.run(vec!["--batch".into(), "--no-tty".into(), "--list-packets".into(), cipher_path.to_string_lossy().into_owned()])?;
+        let used = if listed.status.success() { packet_recipients(&listed.stdout) } else { Vec::new() };
+        Ok(Encrypted { bytes, recipients: if used.is_empty() { recipients.to_vec() } else { used } })
+    }
+
+    /// Decrypt an OpenPGP message with the keys GnuPG has (a smartcard key may ask for its PIN).
+    /// The recipient key ids GnuPG reports are kept, so an encrypted design can be saved again
+    /// without asking the user to name them.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Decrypted, String> {
+        let dir = TempDir::new()?;
+        let cipher_path = dir.path().join("design.gpg");
+        let plain_path = dir.path().join("design.bin");
+        write_private(&cipher_path, ciphertext)?;
+        let output = self.run(vec![
+            "--batch".into(),
+            "--no-tty".into(),
+            "--status-fd".into(),
+            "1".into(),
+            "--logger-fd".into(),
+            "2".into(),
+            "--decrypt".into(),
+            "--output".into(),
+            plain_path.to_string_lossy().into_owned(),
+            cipher_path.to_string_lossy().into_owned(),
+        ])?;
+        if !output.status.success() {
+            return Err(decryption_error(&output));
+        }
+        let bytes = std::fs::read(&plain_path).map_err(|error| format!("the decrypted design could not be read: {error}"))?;
+        if bytes.is_empty() {
+            return Err("GnuPG reported success but decrypted no design".to_owned());
+        }
+        Ok(Decrypted { bytes, recipients: recipients_from_status(&output.stdout) })
+    }
+
     /// The primary fingerprint and user id of `fingerprint`'s key.
     fn describe_key(&self, fingerprint: &str) -> Result<(String, Option<String>), String> {
         let output = self.command(["--with-colons", "--list-keys", fingerprint])?;
@@ -149,6 +225,7 @@ impl Gpg {
         Command::new(&self.program)
             .args(arguments)
             .env("LC_ALL", "C")
+            .envs(self.home.iter().map(|home| ("GNUPGHOME", home.as_os_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -162,6 +239,28 @@ impl Gpg {
 pub struct SigningInfo {
     pub fingerprint: String,
     pub user_id: Option<String>,
+}
+
+/// An encrypted design and the recipient key ids GnuPG encrypted it to.
+pub struct Encrypted {
+    pub bytes: Vec<u8>,
+    pub recipients: Vec<String>,
+}
+
+/// A decrypted design and the GnuPG recipient key ids that could decrypt it.
+pub struct Decrypted {
+    pub bytes: Vec<u8>,
+    pub recipients: Vec<String>,
+}
+
+/// Whether the file at `path` is an OpenPGP message, an encrypted design. Reads its first bytes,
+/// not the whole file (the browser has no GnuPG and never asks).
+pub fn is_encrypted_file(path: &str) -> Result<bool, String> {
+    solidcraft_io::vfs::check(path).map_err(|error| format!("{path}: {error}"))?;
+    let mut file = std::fs::File::open(path).map_err(|error| format!("{path}: {error}"))?;
+    let mut prefix = [0u8; 64];
+    let read = std::io::Read::read(&mut file, &mut prefix).map_err(|error| format!("{path}: {error}"))?;
+    Ok(solidcraft_io::is_openpgp_encrypted(&prefix[..read]))
 }
 
 /// Implements the provenance format's `OpenPgpSigner` with GnuPG, and keeps what GnuPG said about
@@ -223,6 +322,68 @@ fn signing_error(output: &std::process::Output) -> String {
         return "GnuPG could not find the OpenPGP smartcard".to_owned();
     }
     if trimmed.is_empty() { "GnuPG could not sign the design".to_owned() } else { format!("GnuPG could not sign the design: {trimmed}") }
+}
+
+/// Turn GnuPG's encryption failure into a sentence.
+fn encryption_error(output: &std::process::Output) -> String {
+    let log = String::from_utf8_lossy(&output.stderr);
+    let trimmed = log.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+    if log.contains("No user ID") || log.contains("no valid addressees") || log.contains("No recipient") {
+        return "GnuPG has no encryption key for the chosen recipient".to_owned();
+    }
+    if trimmed.is_empty() { "GnuPG could not encrypt the design".to_owned() } else { format!("GnuPG could not encrypt the design: {trimmed}") }
+}
+
+/// Turn GnuPG's decryption failure into a sentence a user can act on.
+fn decryption_error(output: &std::process::Output) -> String {
+    let status = String::from_utf8_lossy(&output.stdout);
+    let log = String::from_utf8_lossy(&output.stderr);
+    let trimmed = log.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+    if log.contains("No secret key") || status.contains("DECRYPTION_FAILED") && log.contains("secret key") {
+        return "No GnuPG secret key on this computer can decrypt this design".to_owned();
+    }
+    if status.contains("SC_OP_FAILURE") || log.contains("Bad PIN") || log.contains("Bad passphrase") {
+        return "GnuPG rejected the card PIN or passphrase (a wrong PIN uses up a card retry)".to_owned();
+    }
+    if log.contains("Operation cancelled") {
+        return "Decryption was cancelled".to_owned();
+    }
+    if log.contains("Inappropriate ioctl") || log.contains("No pinentry") || log.contains("pinentry") {
+        return "GnuPG could not ask for the smartcard PIN: no pinentry is available".to_owned();
+    }
+    if log.contains("OpenPGP card not available") || log.contains("card not available") {
+        return "GnuPG could not find the OpenPGP smartcard".to_owned();
+    }
+    if trimmed.is_empty() { "GnuPG could not decrypt the design".to_owned() } else { format!("GnuPG could not decrypt the design: {trimmed}") }
+}
+
+/// The long key ids in a `--list-packets` description of an encrypted message.
+fn packet_recipients(listing: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(listing);
+    let mut recipients = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.split(":pubkey enc packet:").nth(1) else { continue };
+        let Some(keyid) = rest.split("keyid ").nth(1).and_then(|rest| rest.split_whitespace().next()) else { continue };
+        if !recipients.iter().any(|recipient| recipient == keyid) {
+            recipients.push(keyid.to_owned());
+        }
+    }
+    recipients
+}
+
+/// The long key ids GnuPG says the message was encrypted to.
+fn recipients_from_status(status: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(status);
+    let mut recipients = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("[GNUPG:] ENC_TO ") else { continue };
+        if let Some(keyid) = rest.split_whitespace().next()
+            && !recipients.iter().any(|recipient| recipient == keyid)
+        {
+            recipients.push(keyid.to_owned());
+        }
+    }
+    recipients
 }
 
 /// Where GnuPG is usually installed, before `PATH` (a desktop-launched window may lack the shell's
@@ -426,6 +587,58 @@ mod tests {
     fn a_key_without_signing_capability_is_left_out() {
         let text = "sec:e:2048:1:AAAA:1:0::::e:::scESC::::::23:::::\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
         assert!(parse_secret_keys(text).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gpg_encrypts_and_decrypts_a_design_when_installed() {
+        let Some(found) = Gpg::find() else { return };
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_nanos()).unwrap_or(0);
+        let home = std::env::temp_dir().join(format!("solidcraft-gpg-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&home).unwrap();
+        set_private(&home).unwrap();
+        let raw = |args: &[&str]| std::process::Command::new(&found.program).args(args).env("GNUPGHOME", &home).env("LC_ALL", "C").output().unwrap();
+        let generated = raw(&[
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "SolidCraft Encryption Test <enc@solidcraft.invalid>",
+            "ed25519",
+            "sign,cert",
+            "0",
+        ]);
+        if !generated.status.success() {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+        let listing = raw(&["--batch", "--with-colons", "--list-keys"]).stdout;
+        let listing = String::from_utf8_lossy(&listing);
+        let fingerprint =
+            listing.lines().find_map(|line| line.strip_prefix("fpr:::::::::")).and_then(|rest| rest.split(':').next()).unwrap_or("").to_owned();
+        let added = raw(&["--batch", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-add-key", &fingerprint, "cv25519", "encr", "0"]);
+        let gpg = Gpg { program: found.program.clone(), home: Some(home.clone()) };
+        let result = (|| {
+            assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+            let plain = b"a design's plaintext container";
+            let encrypted = gpg.encrypt(&[], plain).map_err(|e| e.to_string())?;
+            assert!(!encrypted.recipients.is_empty());
+            let decrypted = gpg.decrypt(&encrypted.bytes).map_err(|e| e.to_string())?;
+            assert_eq!(decrypted.bytes, plain);
+            Ok::<(), String>(())
+        })();
+        let _ = std::process::Command::new("gpgconf").args(["--homedir", &home.to_string_lossy(), "--kill", "gpg-agent"]).output();
+        let _ = std::fs::remove_dir_all(&home);
+        result.unwrap();
+    }
+
+    #[test]
+    fn encryption_recipients_are_read_from_packets_and_decryption_status() {
+        let listing = b":pubkey enc packet: version 3, algo 18, keyid DF8DACC1B41949D4\n\tdata: [4096 bits]\n:pubkey enc packet: version 3, algo 18, keyid 1122334455667788\n";
+        assert_eq!(packet_recipients(listing), ["DF8DACC1B41949D4", "1122334455667788"]);
+        let status = b"[GNUPG:] ENC_TO DF8DACC1B41949D4 18 0\n[GNUPG:] DECRYPTION_OKAY\n";
+        assert_eq!(recipients_from_status(status), ["DF8DACC1B41949D4"]);
     }
 
     #[test]

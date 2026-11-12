@@ -42,6 +42,13 @@ operations over maximum compression; compressed STEP was slower in the storage b
 Use `"compression":"compact"` with `file.save` or `file.save_as` to favor file size,
 or `io::write_design_container_with_compression` from Rust.
 
+## Encrypted designs
+
+A design saved encrypted is an OpenPGP message whose plaintext is exactly one of these containers
+(possibly signed, with its provenance entry). It keeps its `.sc` name but is not a ZIP; opening
+detects it by content and asks GnuPG to decrypt it, and a save of such a design encrypts it again.
+Autosaves are encrypted too. See [encrypted design files](formats/design-encryption.md).
+
 ## Bounds and recovery
 
 Input and individual expanded parts are capped at 256 MiB. Total declared expanded

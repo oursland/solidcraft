@@ -697,6 +697,7 @@ pub(crate) fn command_done(
     id: &str,
     params: &Value,
     outcome: std::result::Result<(), String>,
+    encrypted: bool,
 ) {
     let Some(state) = STATE.get() else { return };
     if journaled && let Ok(mut j) = state.journal.lock() {
@@ -718,16 +719,20 @@ pub(crate) fn command_done(
             p.recovered = true;
         }
         let kind = if p.recovered { "kernel_panic_recovered" } else { "command_panic" };
-        let design = solidcraft_io::write_design(before);
+        // An encrypted design's plaintext must not be copied into a crash report (the report and
+        // its replay are files beside the crash, outside the encrypted design). Without it the
+        // report still names the command and parameters that failed.
+        let design = (!encrypted).then(|| solidcraft_io::write_design(before));
         let replay = json!({ "commands": [{ "command": id, "params": params }] });
         let recent = if journaled { read_live_journal(state).recent } else { Vec::new() };
+        let notes = if encrypted { vec!["The design is encrypted; its contents are not copied into this report.".to_owned()] } else { Vec::new() };
         let extra = Extra {
             command: Some(json!({ "command": id, "params": params })),
-            design: Some(design),
+            design,
             replay: Some(replay),
             recent,
             base: json!("the design as it was when the command started"),
-            notes: Vec::new(),
+            notes,
             fields: serde_json::Map::new(),
             attach: Vec::new(),
         };

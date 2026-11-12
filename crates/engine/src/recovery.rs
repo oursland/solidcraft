@@ -156,7 +156,7 @@ pub fn orphans(dir: &Path) -> Vec<Entry> {
 }
 
 /// Read an entry's design.
-pub fn load(dir: &Path, id: &str) -> Result<(Document, Entry)> {
+pub fn load(dir: &Path, id: &str) -> Result<(Document, Entry, Option<Vec<String>>)> {
     if !valid_id(id) {
         return Err(EngineError::Other(format!("no recovered design `{id}`")));
     }
@@ -164,7 +164,13 @@ pub fn load(dir: &Path, id: &str) -> Result<(Document, Entry)> {
     let path = design_file(dir, id);
     let bytes = solidcraft_io::limits::read(&path.to_string_lossy(), solidcraft_io::limits::Kind::Design)
         .map_err(|e| EngineError::Other(format!("recovered design `{id}`: {e}")))?;
-    Ok((solidcraft_io::read_design(&bytes)?, entry))
+    let (bytes, encryption) = if solidcraft_io::is_openpgp_encrypted(&bytes) {
+        let decrypted = decrypt_autosave(&bytes)?;
+        (decrypted.bytes, Some(decrypted.recipients))
+    } else {
+        (bytes, None)
+    };
+    Ok((solidcraft_io::read_design(&bytes)?, entry, encryption))
 }
 
 /// Delete an entry. Only a real one: `<id>.json` must describe entry `id` and its design must
@@ -269,6 +275,9 @@ struct Snapshot {
     doc: Arc<Document>,
     visibility: crate::Visibility,
     path: Option<String>,
+    /// The design is encrypted: encrypt the autosave to these GnuPG recipients (empty: GnuPG's
+    /// default key) so a crash leaves no plaintext design behind.
+    encryption: Option<Vec<String>>,
 }
 
 impl Snapshot {
@@ -281,6 +290,10 @@ impl Snapshot {
             let mut doc = (*self.doc).clone();
             doc.visibility = self.visibility.clone();
             solidcraft_io::write_design_container(&doc)?
+        };
+        let bytes = match &self.encryption {
+            Some(recipients) => encrypt_autosave(&bytes, recipients)?,
+            None => bytes,
         };
         solidcraft_io::write_atomic(&file(&self.dir, &self.id, solidcraft_io::DESIGN_EXT), &bytes, false).map_err(io)?;
         let entry = Entry {
@@ -364,7 +377,7 @@ impl Autosaver {
                 }
                 // No thread to write on: write here, as before.
                 Err(_) => {
-                    let snapshot = Snapshot { dir: self.dir.clone(), id: self.id.clone(), doc, visibility, path: s.path.clone() };
+                    let snapshot = Snapshot { dir: self.dir.clone(), id: self.id.clone(), doc, visibility, path: s.path.clone(), encryption: None };
                     let written = snapshot.write();
                     self.written(s, snapshot.doc, snapshot.visibility, written)?;
                     Ok(true)
@@ -398,7 +411,14 @@ impl Autosaver {
         if self.last.as_ref().is_some_and(|(l, v)| (Arc::ptr_eq(l, &s.doc) || **l == *s.doc) && *v == s.visibility) {
             return None;
         }
-        Some(Snapshot { dir: self.dir.clone(), id: self.id.clone(), doc: s.doc.clone(), visibility: s.visibility.clone(), path: s.path.clone() })
+        Some(Snapshot {
+            dir: self.dir.clone(),
+            id: self.id.clone(),
+            doc: s.doc.clone(),
+            visibility: s.visibility.clone(),
+            path: s.path.clone(),
+            encryption: s.encrypted.then(|| s.encryption_recipients.clone()),
+        })
     }
 
     /// The running write's outcome, once it has one (`wait`: wait for it). True when no write
@@ -459,6 +479,37 @@ impl Autosaver {
     }
 }
 
+/// Encrypt an autosave with GnuPG, so a crash of an encrypted design leaves no plaintext behind.
+#[cfg(not(target_arch = "wasm32"))]
+fn encrypt_autosave(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>> {
+    let gpg = crate::gpg::Gpg::find().ok_or_else(|| EngineError::Other("autosave: encryption needs GnuPG".into()))?;
+    Ok(gpg.encrypt(recipients, plaintext).map_err(|e| EngineError::Other(format!("autosave: {e}")))?.bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn encrypt_autosave(_plaintext: &[u8], _recipients: &[String]) -> Result<Vec<u8>> {
+    Err(EngineError::Other("autosave: the browser cannot encrypt designs".into()))
+}
+
+/// Decrypt an encrypted autosave (a key on a smartcard may ask for its PIN).
+/// A decrypted autosave: the container bytes and who can decrypt them.
+struct DecryptedAutosave {
+    bytes: Vec<u8>,
+    recipients: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decrypt_autosave(ciphertext: &[u8]) -> Result<DecryptedAutosave> {
+    let gpg = crate::gpg::Gpg::find().ok_or_else(|| EngineError::Other("recovered design: encryption needs GnuPG".into()))?;
+    let decrypted = gpg.decrypt(ciphertext).map_err(|e| EngineError::Other(format!("recovered design: {e}")))?;
+    Ok(DecryptedAutosave { bytes: decrypted.bytes, recipients: decrypted.recipients })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decrypt_autosave(_ciphertext: &[u8]) -> Result<DecryptedAutosave> {
+    Err(EngineError::Other("recovered design: the browser cannot decrypt designs".into()))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -475,7 +526,7 @@ mod tests {
             let entry = Entry { id: id.into(), path: Some(format!("/d/part.{ext}")), name: "part".into(), saved_at: 1, features: 0 };
             fs::write(d.join(format!("{id}.json")), serde_json::to_vec(&entry).unwrap()).unwrap();
             assert_eq!(orphans(&d).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), [id], ".{ext}");
-            let (_, loaded) = load(&d, id).unwrap();
+            let (_, loaded, _) = load(&d, id).unwrap();
             assert_eq!(loaded, entry);
             remove(&d, id).unwrap();
             assert!(orphans(&d).is_empty() && !d.join(format!("{id}.{ext}")).exists(), ".{ext}");
@@ -543,7 +594,7 @@ mod tests {
         drop(a);
         let found = orphans(&d);
         assert_eq!(found.len(), 1);
-        let (doc, entry) = load(&d, &found[0].id).unwrap();
+        let (doc, entry, _) = load(&d, &found[0].id).unwrap();
         assert_eq!(doc, *s.doc);
         assert_eq!(entry.features, 1);
         remove(&d, &entry.id).unwrap();

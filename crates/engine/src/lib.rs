@@ -508,6 +508,11 @@ pub struct Session {
     pub provenance_chain: Option<solidcraft_io::ProvenanceChain>,
     /// The last provenance verification of this design, when one was asked for.
     pub provenance: Option<solidcraft_io::ProvenanceReport>,
+    /// This design's file is an OpenPGP-encrypted container (desktop GnuPG only).
+    pub encrypted: bool,
+    /// The GnuPG recipient key ids a save encrypts to: from this session's own save, or from
+    /// decrypting the file it opened.
+    pub encryption_recipients: Vec<String>,
     /// Whether the design's name is one its user chose for it (`file.new {name}`) rather than
     /// one it borrowed — from a file's name, a sample's name, or a file that stored another
     /// design's name. A borrowed name follows Save As to the new file's name (#4907); a name
@@ -852,6 +857,8 @@ impl Session {
             read_only: false,
             provenance_chain: None,
             provenance: None,
+            encrypted: false,
+            encryption_recipients: Vec::new(),
             user_named: false,
             open_preview: None,
             log: Vec::new(),
@@ -1879,7 +1886,7 @@ impl Session {
             // Refresh and body-name pinning can copy the shared document. Remember the final
             // document, so the next command does not mistake that work for an outside edit
             // and discard the replay. Failed commands have restored their document by now.
-            crash::command_done(self.crash_journal, changed, &before, &self.doc, spec.id, given, failed.map_or(Ok(()), Err));
+            crash::command_done(self.crash_journal, changed, &before, &self.doc, spec.id, given, failed.map_or(Ok(()), Err), self.encrypted);
         }
         result
     }
@@ -2007,6 +2014,8 @@ impl Session {
             read_only: self.read_only,
             provenance_chain: self.provenance_chain.clone(),
             provenance: self.provenance.clone(),
+            encrypted: self.encrypted,
+            encryption_recipients: self.encryption_recipients.clone(),
             user_named: self.user_named,
             open_preview: None,
             saved: self.saved.clone(),

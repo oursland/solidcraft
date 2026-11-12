@@ -26,14 +26,14 @@ use crate::params::{bad, bool_, num, str_, string_list};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::schema::file::GpgKeyInfo;
 use crate::schema::file::{
-    ExportResult, GpgKeysParams, GpgKeysResult, NewerFileReport, OpenElsewhere, OpenResult, OpenedDesign, OpenedDrawing, OpenedFile,
-    OpenedPointCloud, RecoverParams, RecoverResult, RecoveredDesign, RecoveryDiscardParams, RecoveryDiscardResult, RecoveryListParams,
+    EncryptionReport, ExportResult, GpgKeysParams, GpgKeysResult, NewerFileReport, OpenElsewhere, OpenResult, OpenedDesign, OpenedDrawing,
+    OpenedFile, OpenedPointCloud, RecoverParams, RecoverResult, RecoveredDesign, RecoveryDiscardParams, RecoveryDiscardResult, RecoveryListParams,
     RecoveryListResult, SignatureRecord, SignatureReport, VerifyParams, VerifyResult,
 };
 use crate::schema::insert_mesh::{InsertMeshParams, MeshInserted};
 use crate::schema::insert_step::{InsertStepParams, StepInserted};
 use crate::schema::new_design::{NewDesignParams, NewDesignResult};
-use crate::schema::save::{SaveAsParams, SaveParams, SaveResult, SignedSave};
+use crate::schema::save::{EncryptedSave, SaveAsParams, SaveParams, SaveResult, SignedSave};
 use crate::schema::save_mesh::{SaveMeshResult, SlicerDelivery};
 use crate::schema::slicers::{SlicerInfo, SlicersParams, SlicersResult};
 use crate::schema::{TypedContract, output_schema_for};
@@ -75,20 +75,20 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .contract(&SAVE_CONTRACT)
         .output(output_schema_for::<SaveResult>)
-        .params("path? (default: current file; a name that opens as another kind of file, such as .step, .stl or .dxf, is refused: file.export writes those); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (replace the design's file even though another program or computer changed it since it was opened or saved; without it that save is refused); sign?: bool (default false: sign the save with GnuPG, appending a provenance record; container only); signing_key?: fingerprint or user id (default: GnuPG's default signing key) → signature: {method, fingerprint, user_id?} when signed"),
+        .params("path? (default: current file; a name that opens as another kind of file, such as .step, .stl or .dxf, is refused: file.export writes those); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (replace the design's file even though another program or computer changed it since it was opened or saved; without it that save is refused); sign?: bool (default false: sign the save with GnuPG, appending a provenance record; container only); signing_key?: fingerprint or user id (default: GnuPG's default signing key); encrypt?: bool (default: keep an encrypted design encrypted; true encrypts, false writes plaintext when the command says so; desktop only); encryption_recipients?: GnuPG ids/fingerprints/user ids, comma-separated (default: GnuPG's default key) → signature: {method, fingerprint, user_id?} when signed; encryption: {method, recipients} when encrypted"),
     CommandSpec::new("file.save_as", "Save As", crate::checked!("file.save_as", save_as))
         .icon("save")
         .key("Ctrl+Shift+S")
         .noundo()
         .contract(&SAVE_AS_CONTRACT)
         .output(output_schema_for::<SaveResult>)
-        .params("path (a design file name, .sc as a rule; one that opens as another kind of file, such as .step, .stl or .dxf, is refused: file.export writes those); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (as file.save, when `path` is the design's own file); sign?: bool and signing_key? (as file.save)"),
+        .params("path (a design file name, .sc as a rule; one that opens as another kind of file, such as .step, .stl or .dxf, is refused: file.export writes those); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (as file.save, when `path` is the design's own file); sign?: bool and signing_key? (as file.save); encrypt?: bool and encryption_recipients? (as file.save)"),
     CommandSpec::new("file.verify", "Verify Signature", crate::checked!("file.verify", verify))
         .icon("shield")
         .noundo()
         .contract(&VERIFY_CONTRACT)
         .output(output_schema_for::<VerifyResult>)
-        .params("path? (default: the design's current file) → {path, status, reason?, truncated, records: [{method, key_id, user_id?, author?, created?, format, covered}]}: status is unsigned, valid, not_covered (signed earlier, saved since without a key), invalid or unsupported"),
+        .params("path? (default: the design's current file) → {path, encrypted, status, reason?, truncated, records: [{method, key_id, user_id?, author?, created?, format, covered}]}: status is unsigned, valid, not_covered (signed earlier, saved since without a key), invalid or unsupported; an encrypted design is decrypted first"),
     CommandSpec::new("file.gpg_keys", "Signing Keys", crate::checked!("file.gpg_keys", gpg_keys))
         .icon("shield")
         .noundo()
@@ -645,18 +645,63 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let verify = bool_(p, "verify").unwrap_or(false);
     // Stamped before it is read: a write while it is being read is a change too.
     let disk = solidcraft_io::design_lock::stamp(path);
-    let (doc, saved) = read_design(s, path)?;
+    let (doc, saved, encryption) = read_design(s, path, verify)?;
     let opened = Session::opened_at_validating(doc, saved.as_ref(), Some(path), s.validation());
-    opened_design(s, opened, path, read_only, disk, verify)
+    opened_design(s, opened, path, read_only, disk, verify, encryption)
+}
+
+/// What an encrypted design's file said while it was decrypted.
+pub(crate) struct OpenedEncryption {
+    pub recipients: Vec<String>,
+    pub chain: Option<solidcraft_io::ProvenanceChain>,
+    pub provenance: Option<solidcraft_io::ProvenanceReport>,
 }
 
 /// Read the design file at `path` for `doc.open`, under its file's name if it has none of its own.
-fn read_design(s: &mut Session, path: &str) -> Result<(Document, Option<solidcraft_doc::SavedModel>)> {
-    let (mut doc, saved) = solidcraft_io::read_design_file(path, s.open_preview.take()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+fn read_design(s: &mut Session, path: &str, verify: bool) -> Result<(Document, Option<solidcraft_doc::SavedModel>, Option<OpenedEncryption>)> {
+    // An encrypted design is an OpenPGP message, not a container: GnuPG decrypts it, and what it
+    // says about its recipients is kept so a later save can encrypt it again.
+    #[cfg(target_arch = "wasm32")]
+    let _ = verify;
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::gpg::is_encrypted_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))? {
+        let gpg = crate::gpg::Gpg::find()
+            .ok_or_else(|| EngineError::Other(format!("{path}: encrypted designs need GnuPG, which was not found on this computer")))?;
+        let cipher =
+            solidcraft_io::vfs::read(path, solidcraft_io::limits::max_design_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let decrypted = gpg.decrypt(&cipher).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let mut reader = solidcraft_io::DesignContainerReader::new(std::io::Cursor::new(decrypted.bytes))
+            .map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let saved = reader.geometry();
+        let chain = reader.provenance_chain();
+        let provenance = if verify { reader.provenance() } else { None };
+        let mut doc = reader.read_document().map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        if let Some(stem) = default_name_for(&doc.name, path) {
+            doc.name = stem;
+        }
+        return Ok((doc, saved, Some(OpenedEncryption { recipients: decrypted.recipients, chain, provenance })));
+    }
+    let read = solidcraft_io::read_design_file(path, s.open_preview.take());
+    let (mut doc, saved) = match read {
+        Ok(read) => read,
+        Err(error) => {
+            // The browser cannot decrypt, but it can say why a design did not open.
+            #[cfg(target_arch = "wasm32")]
+            if solidcraft_io::vfs::read(path, solidcraft_io::limits::max_design_bytes())
+                .ok()
+                .is_some_and(|bytes| solidcraft_io::is_openpgp_encrypted(&bytes))
+            {
+                return Err(EngineError::Other(format!(
+                    "{path}: this design is encrypted: open it in the desktop app with GnuPG, which the browser cannot run"
+                )));
+            }
+            return Err(EngineError::Other(format!("{path}: {error}")));
+        }
+    };
     if let Some(stem) = default_name_for(&doc.name, path) {
         doc.name = stem;
     }
-    Ok((doc, saved))
+    Ok((doc, saved, None))
 }
 
 /// `doc.open` of a design: `opened`, the design read from `path` and evaluated, takes `s`'s
@@ -668,12 +713,25 @@ fn opened_design(
     read_only: bool,
     disk: Option<solidcraft_io::design_lock::FileStamp>,
     verify: bool,
+    encryption: Option<OpenedEncryption>,
 ) -> Result<Value> {
     s.replace_design(opened);
     s.disk = disk;
     s.read_only = read_only;
-    s.provenance_chain = solidcraft_io::read_design_provenance_chain_file(path);
-    s.provenance = verify.then(|| solidcraft_io::read_design_provenance_file(path)).flatten();
+    match encryption {
+        Some(encryption) => {
+            s.encrypted = true;
+            s.encryption_recipients = encryption.recipients;
+            s.provenance_chain = encryption.chain;
+            s.provenance = encryption.provenance;
+        }
+        None => {
+            s.encrypted = false;
+            s.encryption_recipients.clear();
+            s.provenance_chain = solidcraft_io::read_design_provenance_chain_file(path);
+            s.provenance = verify.then(|| solidcraft_io::read_design_provenance_file(path)).flatten();
+        }
+    }
     // A design saved with print faces (by an older version, or with them kept) opens without
     // them when they are not kept (#11512). The rest of it opens as saved, and dropping them is
     // neither an unsaved change nor a step to undo.
@@ -705,6 +763,7 @@ fn opened_design(
         }),
         warnings: s.doc.newer_file.as_ref().map(|file| file.warnings()),
         signature: s.provenance.as_ref().map(signature_report),
+        encryption: s.encrypted.then(|| EncryptionReport { method: "gpg".to_owned(), recipients: s.encryption_recipients.clone() }),
         param_warnings: Vec::new(),
     }))
 }
@@ -876,6 +935,8 @@ fn write(
     overwrite: bool,
     sign: bool,
     signing_key: Option<&str>,
+    encrypt: Option<bool>,
+    encryption_recipients: Option<&str>,
 ) -> Result<Value> {
     // A path outside the agent's folders says so first, whatever its name.
     solidcraft_io::vfs::check(path).map_err(|e| EngineError::Other(e.to_string()))?;
@@ -906,7 +967,7 @@ fn write(
     if let Some((from, to)) = &renamed {
         rename_design(s, from, to);
     }
-    let r = write_file(s, path, format, compression, preview, cache, sign, signing_key);
+    let r = write_file(s, path, format, compression, preview, cache, sign, signing_key, encrypt, encryption_recipients);
     if r.is_err()
         && let Some((from, to)) = &renamed
     {
@@ -924,13 +985,15 @@ fn write_file(
     cache: bool,
     sign: bool,
     signing_key: Option<&str>,
+    encrypt: Option<bool>,
+    encryption_recipients: Option<&str>,
 ) -> Result<Value> {
     let compression = match compression {
         "fast" => solidcraft_io::DesignCompression::Fast,
         "compact" => solidcraft_io::DesignCompression::Compact,
         _ => return Err(bad("file.save", "compression must be fast or compact")),
     };
-    write_bytes(s, path, format, compression, preview, cache, sign, signing_key)
+    write_bytes(s, path, format, compression, preview, cache, sign, signing_key, encrypt, encryption_recipients)
 }
 
 fn write_bytes(
@@ -942,10 +1005,13 @@ fn write_bytes(
     cache: bool,
     sign: bool,
     signing_key: Option<&str>,
+    encrypt: Option<bool>,
+    encryption_recipients: Option<&str>,
 ) -> Result<Value> {
     let chain = s.provenance_chain.clone().unwrap_or_default();
+    let encrypt = encrypt.unwrap_or(s.encrypted);
     let mut signature = None;
-    let bytes = if sign {
+    let plaintext = if sign {
         if format != "container" {
             return Err(bad("file.save", "only a container can carry a signature: save as .sc (format container), not json"));
         }
@@ -973,6 +1039,17 @@ fn write_bytes(
             _ => return Err(bad("file.save", "format must be container or json")),
         }
     };
+    let chain_after = solidcraft_io::read_design_provenance_chain(&plaintext);
+    let (bytes, encryption) = if encrypt {
+        if format != "container" {
+            return Err(bad("file.save", "only a container can be encrypted: save as .sc (format container), not json"));
+        }
+        let recipients = recipient_list(encryption_recipients, &s.encryption_recipients);
+        let (bytes, used) = encrypt_design(&plaintext, &recipients)?;
+        (bytes, Some(EncryptedSave { method: "gpg".to_owned(), recipients: used }))
+    } else {
+        (plaintext, None)
+    };
     // Cancelled while the design was being prepared (a watched save): nothing is written.
     if solidcraft_kernel::watch::current().is_some_and(|w| w.cancelled()) {
         return Err(EngineError::Other(format!("{path}: save cancelled")));
@@ -983,8 +1060,14 @@ fn write_bytes(
     s.path = Some(path.to_string());
     s.disk = solidcraft_io::design_lock::stamp(path);
     s.read_only = false;
-    s.provenance_chain = solidcraft_io::read_design_provenance_chain(&bytes);
+    s.provenance_chain = chain_after;
     s.provenance = None;
+    s.encrypted = encryption.is_some();
+    if let Some(encryption) = &encryption {
+        s.encryption_recipients.clone_from(&encryption.recipients);
+    } else {
+        s.encryption_recipients.clear();
+    }
     s.mark_saved();
     let mut out = SaveResult {
         path: path.to_string(),
@@ -995,6 +1078,7 @@ fn write_bytes(
         not_kept: None,
         param_warnings: Vec::new(),
         signature,
+        encryption,
     };
     // A newer SolidCraft's file keeps what this version can't read, and its format number. What
     // couldn't go back, because the design was changed around it, is said.
@@ -1052,19 +1136,66 @@ fn write_signed_container(
     Err(bad("file.save", "signing needs the desktop app and GnuPG; the browser cannot sign"))
 }
 
+/// The recipients a save encrypts to: the command's list, else the session's, else GnuPG's own
+/// default key (an empty list).
+fn recipient_list(given: Option<&str>, session: &[String]) -> Vec<String> {
+    let given = given.map(str::trim).filter(|given| !given.is_empty());
+    match given {
+        // A user id may contain spaces ("Ada Lovelace <ada@example.com>"), so only commas and
+        // semicolons separate recipients.
+        Some(given) => given.split([',', ';']).map(str::trim).filter(|part| !part.is_empty()).map(str::to_owned).collect(),
+        None => session.to_vec(),
+    }
+}
+
+/// Encrypt a prepared container. Desktop only: the browser has no GnuPG.
+#[cfg(not(target_arch = "wasm32"))]
+fn encrypt_design(plaintext: &[u8], recipients: &[String]) -> Result<(Vec<u8>, Vec<String>)> {
+    let gpg = crate::gpg::Gpg::find().ok_or_else(|| bad("file.save", "encryption needs GnuPG, which was not found on this computer"))?;
+    let encrypted = gpg.encrypt(recipients, plaintext).map_err(|e| EngineError::Other(format!("encrypting the design: {e}")))?;
+    Ok((encrypted.bytes, encrypted.recipients))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn encrypt_design(_plaintext: &[u8], _recipients: &[String]) -> Result<(Vec<u8>, Vec<String>)> {
+    Err(bad("file.save", "encryption needs the desktop app and GnuPG; the browser cannot encrypt"))
+}
+
 /// `file.verify`: check a saved design's signature.
 fn verify(s: &mut Session, p: &Value) -> Result<Value> {
     let path = match str_(p, "path") {
         Some(path) if !path.trim().is_empty() => path.to_owned(),
         _ => s.path.clone().ok_or_else(|| bad("file.verify", "the design has no file yet: give a `path`"))?,
     };
+    #[cfg(target_arch = "wasm32")]
+    if solidcraft_io::vfs::read(&path, solidcraft_io::limits::max_design_bytes())
+        .ok()
+        .is_some_and(|bytes| solidcraft_io::is_openpgp_encrypted(&bytes))
+    {
+        return Err(bad("file.verify", "this design is encrypted: verify it in the desktop app with GnuPG"));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::gpg::is_encrypted_file(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))? {
+        let gpg = crate::gpg::Gpg::find()
+            .ok_or_else(|| EngineError::Other(format!("{path}: encrypted designs need GnuPG, which was not found on this computer")))?;
+        let cipher =
+            solidcraft_io::vfs::read(&path, solidcraft_io::limits::max_design_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let decrypted = gpg.decrypt(&cipher).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let report = solidcraft_io::read_design_provenance(&decrypted.bytes);
+        s.provenance = report.clone();
+        let signature = match &report {
+            Some(report) => signature_report(report),
+            None => SignatureReport { status: "unsigned".to_owned(), reason: None, truncated: false, records: Vec::new() },
+        };
+        return serde_json::to_value(VerifyResult { path, encrypted: true, signature }).map_err(|e| bad("file.verify", e.to_string()));
+    }
     let report = solidcraft_io::read_design_provenance_file(&path);
     s.provenance = report.clone();
     let signature = match &report {
         Some(report) => signature_report(report),
         None => SignatureReport { status: "unsigned".to_owned(), reason: None, truncated: false, records: Vec::new() },
     };
-    serde_json::to_value(VerifyResult { path, signature }).map_err(|e| bad("file.verify", e.to_string()))
+    serde_json::to_value(VerifyResult { path, encrypted: false, signature }).map_err(|e| bad("file.verify", e.to_string()))
 }
 
 /// `file.gpg_keys`: the GnuPG keys a signed save can use.
@@ -1399,6 +1530,8 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
         bool_(p, "overwrite").unwrap_or(false),
         bool_(p, "sign").unwrap_or(false),
         str_(p, "signing_key"),
+        bool_(p, "encrypt"),
+        str_(p, "encryption_recipients"),
     )
 }
 
@@ -1419,6 +1552,8 @@ fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
         bool_(p, "overwrite").unwrap_or(false),
         bool_(p, "sign").unwrap_or(false),
         str_(p, "signing_key"),
+        bool_(p, "encrypt"),
+        str_(p, "encryption_recipients"),
     )
 }
 
@@ -1888,11 +2023,13 @@ fn recover(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "doc.recover";
     let dir = recovery_dir(p, cmd)?;
     let id = str_(p, "id").ok_or_else(|| bad(cmd, "`id` is required (see doc.recovery_list)"))?;
-    let (mut doc, entry) = crate::recovery::load(&dir, id)?;
+    let (mut doc, entry, encryption) = crate::recovery::load(&dir, id)?;
     if let Some(stem) = entry.path.as_deref().and_then(|path| default_name_for(&doc.name, path)) {
         doc.name = stem;
     }
     s.replace_design(Session::opened_at_validating(doc, None, entry.path.as_deref(), s.validation()));
+    s.encrypted = encryption.is_some();
+    s.encryption_recipients = encryption.unwrap_or_default();
     s.mark_unsaved();
     if bool_(p, "discard").unwrap_or(false) {
         crate::recovery::remove(&dir, id)?;

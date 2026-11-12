@@ -213,7 +213,7 @@ fn child() {
             drop(scope);
             assert!(matches!(r.as_slice(), [Err(solidcraft_kernel::KernelError::Internal(_))]), "{r:?}");
             assert!(list(&STATE.get().unwrap().dir).is_empty(), "the worker's panic waits for the command to end");
-            command_done(true, false, &before, &s.doc, "test.guarded_worker", &params, Err("the item failed".into()));
+            command_done(true, false, &before, &s.doc, "test.guarded_worker", &params, Err("the item failed".into()), false);
         }
         // `thread_dies`: the panic ends the app, as one on the window's thread does.
         "thread" | "thread_dies" => {

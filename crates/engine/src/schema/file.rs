@@ -541,6 +541,9 @@ pub struct OpenedDesign {
     /// With `verify: true`, when the file carries a signature: what verification found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<SignatureReport>,
+    /// When the design's file is OpenPGP-encrypted: who can decrypt it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionReport>,
     /// In the warn parameter-check mode: what the call's parameters got wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub param_warnings: Vec<String>,
@@ -560,6 +563,15 @@ pub struct SignatureReport {
     pub truncated: bool,
     /// The records, oldest first; the last is the newest save.
     pub records: Vec<SignatureRecord>,
+}
+
+/// An encrypted design, as opening it reports it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EncryptionReport {
+    /// `gpg` for an OpenPGP message made (and unlocked) by GnuPG.
+    pub method: String,
+    /// The GnuPG recipient key ids the file is encrypted to.
+    pub recipients: Vec<String>,
 }
 
 /// One signed save, as a signature check reports it.
@@ -597,6 +609,8 @@ pub struct VerifyParams {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct VerifyResult {
     pub path: String,
+    /// The file is OpenPGP-encrypted; its contents were decrypted before checking.
+    pub encrypted: bool,
     #[serde(flatten)]
     pub signature: SignatureReport,
 }
