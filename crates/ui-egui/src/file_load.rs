@@ -476,12 +476,20 @@ fn default_reuse_import(app: &SolveApp, request: &mut Request) {
 }
 
 /// Import options the preferences add for `path` (with `history: solids` a FreeCAD file brings
-/// only its solids, as before its history was rebuilt).
+/// only its solids, as before its history was rebuilt; with `reader: cadmpeg` cadmpeg reads a
+/// STEP file).
 pub(crate) fn preferred_options(app: &SolveApp, path: &str) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     let freecad = std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("fcstd"));
     if freecad && !app.preferences.freecad_history {
         out.insert("history".into(), json!("solids"));
+    }
+    let step = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("step") || e.eq_ignore_ascii_case("stp"));
+    if step && app.preferences.step_reader_cadmpeg {
+        out.insert("reader".into(), json!("cadmpeg"));
     }
     out
 }
@@ -2088,6 +2096,29 @@ mod tests {
             let got: Vec<&str> = app.session.doc.features.iter().map(|f| f.kind.type_name()).collect();
             assert_eq!(got, types, "preference {on}");
         }
+    }
+
+    /// A STEP file is read by SolidCraft's own reader, which keeps the STEP text; with the
+    /// preference on, by cadmpeg into records, with no STEP text kept. Both bring the same washer.
+    #[test]
+    fn step_reader_preference_reads_step_with_cadmpeg_into_records() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/step-conformance/washer.step");
+        assert!(!crate::prefs::Prefs::default().step_reader_cadmpeg, "off by default");
+        let mut volumes = Vec::new();
+        for on in [false, true] {
+            let mut app = SolveApp::new(Session::default(), Default::default());
+            app.preferences.step_reader_cadmpeg = on;
+            app.insert_path(path);
+            let import = app.session.doc.features.iter().find_map(|f| match &f.kind {
+                solidcraft_engine::doc::FeatureKind::Import { step, records, .. } => Some((step.is_empty(), records.is_some())),
+                _ => None,
+            });
+            assert_eq!(import, Some((on, on)), "preference {on}");
+            let bodies = &app.session.model.state().bodies;
+            assert_eq!(bodies.len(), 1, "preference {on}");
+            volumes.push(solidcraft_engine::kernel::measure(&bodies[0].body).unwrap().volume);
+        }
+        assert!((volumes[0] - volumes[1]).abs() < 1e-6 * volumes[0], "{volumes:?}");
     }
 
     #[test]

@@ -32,7 +32,9 @@ pub mod limits;
 #[cfg(test)]
 mod mutate;
 mod native_cad;
-pub use native_cad::{NATIVE_CAD_EXTS, NativeDesign, detects_freecad, is_freecad_path, is_native_cad_path, native_cad_design, native_cad_records};
+pub use native_cad::{
+    NATIVE_CAD_EXTS, NativeDesign, cadmpeg_step_records, detects_freecad, is_freecad_path, is_native_cad_path, native_cad_design, native_cad_records,
+};
 pub mod paper;
 mod ply;
 mod ply_complex;
@@ -256,14 +258,44 @@ pub fn step_import_feature(bytes: &[u8], file: &str) -> Result<StepFeature> {
     step_import_feature_named(bytes, file, StepNames::default())
 }
 
+/// Which reader reads a STEP file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StepReader {
+    /// SolidCraft's own STEP reader (solidcore's), which keeps the STEP text.
+    #[default]
+    SolidCraft,
+    /// cadmpeg's STEP decoder, whose neutral model is read into B-rep records as a FreeCAD or
+    /// Rhino file's is: to compare with SolidCraft's reader. IGES is always SolidCraft's.
+    Cadmpeg,
+}
+
+impl StepReader {
+    /// `solidcraft` or `cadmpeg` (any case); `None` for anything else.
+    pub fn parse(s: &str) -> Option<StepReader> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "solidcraft" => Some(StepReader::SolidCraft),
+            "cadmpeg" => Some(StepReader::Cadmpeg),
+            _ => None,
+        }
+    }
+}
+
 /// [`step_import_feature`], with the bodies named after `names`.
 pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> Result<StepFeature> {
+    step_import_feature_read(bytes, file, names, StepReader::SolidCraft)
+}
+
+/// [`step_import_feature_named`], a STEP file read by `reader`.
+pub fn step_import_feature_read(bytes: &[u8], file: &str, names: StepNames, reader: StepReader) -> Result<StepFeature> {
     let _span = solidcraft_profile::span("import", "step_import_feature_named");
     limits::check(limits::Kind::Step, bytes.len() as u64).map_err(IoError::Invalid)?;
+    if reader == StepReader::Cadmpeg && is_step_path(file) && !is_iges_path(file) && !is_native_cad_path(file) {
+        return records_import_feature(cadmpeg_step_records(bytes, file).map_err(IoError::Invalid)?, file, names);
+    }
     // STEP is 7-bit text with escapes; tolerate stray 8-bit bytes. IGES is restated as STEP (the
     // feature keeps that STEP text); the cadmpeg formats are read into records.
     if is_native_cad_path(file) {
-        return native_import_feature(bytes, file, names);
+        return records_import_feature(native_cad_records(bytes, file).map_err(IoError::Invalid)?, file, names);
     }
     let text = step_text(bytes);
     let (text, iges_warnings) =
@@ -299,14 +331,14 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     })
 }
 
-/// A FreeCAD or Rhino file read into an Import feature that keeps the B-rep records cadmpeg's
-/// neutral model was read into (no STEP text). A FreeCAD body's hidden intermediate shapes (each
+/// A file cadmpeg read (FreeCAD, Rhino, or STEP with [`StepReader::Cadmpeg`]) as an Import
+/// feature that keeps the B-rep records its neutral model was read into (no STEP text). A FreeCAD body's hidden intermediate shapes (each
 /// pad and pocket, the tool shapes, sketch faces, which FreeCAD shows only through its body's
 /// own shape) are not built, unless nothing else is; a Rhino file's hidden objects are its user's
 /// own choice, so they are built and start hidden. The format is the one cadmpeg detects in the
 /// contents, not the file's name.
-fn native_import_feature(bytes: &[u8], file: &str, names: StepNames) -> Result<StepFeature> {
-    let (records, decode_warnings, freecad) = native_cad_records(bytes, file).map_err(IoError::Invalid)?;
+fn records_import_feature(read: (solidcraft_kernel::ImportRecords, Vec<String>, bool), file: &str, names: StepNames) -> Result<StepFeature> {
+    let (records, decode_warnings, freecad) = read;
     let text = solidcraft_kernel::records_text(&records)?;
     design::check_step_importable(&text)?;
     let imp = solidcraft_kernel::records_import_shared(&records)?;

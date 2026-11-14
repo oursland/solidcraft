@@ -1,0 +1,18 @@
+{
+  "en": {
+    "settings.step_reader_cadmpeg": "Read STEP files with cadmpeg instead of SolidCraft's own reader (for comparing the two)",
+    "prefs.step_files": "STEP files"
+  },
+  "es": {
+    "settings.step_reader_cadmpeg": "Leer los archivos STEP con cadmpeg en lugar del lector propio de SolidCraft (para comparar los dos)",
+    "prefs.step_files": "Archivos STEP"
+  },
+  "de": {
+    "settings.step_reader_cadmpeg": "STEP-Dateien mit cadmpeg statt mit dem eigenen Leser von SolidCraft lesen (zum Vergleich der beiden)",
+    "prefs.step_files": "STEP-Dateien"
+  },
+  "fr": {
+    "settings.step_reader_cadmpeg": "Lire les fichiers STEP avec cadmpeg plutôt qu'avec le lecteur de SolidCraft (pour comparer les deux)",
+    "prefs.step_files": "Fichiers STEP"
+  }
+}

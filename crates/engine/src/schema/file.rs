@@ -465,6 +465,17 @@ pub enum HistoryParam {
     Solids,
 }
 
+/// `reader` of `doc.open` and `file.insert_step`: which reader reads a STEP file.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReaderParam {
+    /// SolidCraft's own STEP reader, which keeps the STEP text in the design.
+    Solidcraft,
+    /// cadmpeg's STEP decoder: the file's neutral model is read into B-rep records, as a FreeCAD
+    /// or Rhino file's is, to compare with SolidCraft's reader.
+    Cadmpeg,
+}
+
 /// Open a file as the design: a SolidCraft design (`.sc`, or a `.solidcraft` design from an
 /// earlier release), a `.dxf` or `.svg` drawing (a new, unsaved design with an XY sketch, with
 /// the units and defaults of `sketch.insert_dxf` and `sketch.insert_svg`), a STEP, IGES,
@@ -494,6 +505,10 @@ pub struct OpenParams {
     /// SolidCraft features, or only its solids as one Import feature. Default: features.
     #[serde(default)]
     pub history: Option<HistoryParam>,
+    /// For a STEP file (`.step`, `.stp`; ignored for other files): which reader reads it.
+    /// Default: solidcraft.
+    #[serde(default)]
+    pub reader: Option<ReaderParam>,
     /// For a 3MF, STL, OBJ or glTF file only (refused for any other): true moves the mesh so its
     /// box is centred on X and Y with its base on Z = 0. Default: false.
     #[serde(default)]

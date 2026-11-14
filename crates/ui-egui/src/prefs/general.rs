@@ -156,6 +156,10 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         ui_kit::settings_section(ui, "freecad", app.tr("prefs.freecad_files"), |ui| {
             setting::freecad_history(app, ui);
         });
+        ui_kit::settings_section(ui, "step", app.tr("prefs.step_files"), |ui| {
+            let reader = setting::step_reader_cadmpeg(app, ui);
+            crate::scenario::publish_target("prefs:step_reader_cadmpeg", reader.rect);
+        });
         ui_kit::settings_section(ui, "dialogs", app.tr("prefs.dialogs"), |ui| {
             let right_click = setting::right_click_confirms(app, ui);
             crate::scenario::publish_target("prefs:right_click_confirms", right_click.rect);

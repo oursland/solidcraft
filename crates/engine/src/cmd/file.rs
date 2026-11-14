@@ -281,6 +281,10 @@ struct StepOptions {
     folder: bool,
     /// A FreeCAD file's feature history is rebuilt as features (else only its solids come in).
     history: bool,
+    /// `reader: "cadmpeg"`: a STEP file is read by cadmpeg's STEP decoder into records, as a
+    /// FreeCAD or Rhino file is, to compare with SolidCraft's own reader (`solidcraft`, the
+    /// default).
+    reader: solidcraft_io::StepReader,
 }
 
 fn step_options(p: &Value, cmd: &str) -> Result<StepOptions> {
@@ -316,7 +320,13 @@ fn step_options(p: &Value, cmd: &str) -> Result<StepOptions> {
             }
         },
     };
-    Ok(StepOptions { y_up, names, folder, history })
+    let reader = match p.get("reader") {
+        None | Some(Value::Null) => solidcraft_io::StepReader::default(),
+        Some(v) => v.as_str().and_then(solidcraft_io::StepReader::parse).ok_or_else(|| {
+            bad(cmd, "`reader` must be \"solidcraft\" (SolidCraft's own STEP reader) or \"cadmpeg\" (cadmpeg's STEP decoder, read into records)")
+        })?,
+    };
+    Ok(StepOptions { y_up, names, folder, history, reader })
 }
 
 /// Which way is up in a STEP or IGES file, from the program its header names: `("y", name)` for
@@ -404,7 +414,8 @@ fn add_step_bytes(
             Err(why) => not_rebuilt = Some(format!("the feature history was not rebuilt, so the file's solids were imported instead: {why}")),
         }
     }
-    let mut sf = solidcraft_io::step_import_feature_named(bytes, path, options.names).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut sf = solidcraft_io::step_import_feature_read(bytes, path, options.names, options.reader)
+        .map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     sf.warnings.splice(0..0, not_rebuilt);
     add_read_step(s, path, name, options, sf, bytes, profiled)
 }
@@ -516,7 +527,7 @@ fn open_step(
     let key = solidcraft_io::ImportCache::key(
         &bytes,
         path,
-        &json!({"y_up": options.y_up, "names": format!("{:?}", options.names), "folder": options.folder}),
+        &json!({"y_up": options.y_up, "names": format!("{:?}", options.names), "folder": options.folder, "reader": format!("{:?}", options.reader)}),
     );
     let stem = std::path::Path::new(path).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into());
     if let Some((doc, saved, mut reply)) = cache.and_then(|cache| cache.read(&key)) {
