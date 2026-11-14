@@ -9,6 +9,7 @@
 
 pub mod p21;
 mod parallel;
+pub mod records;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -1274,14 +1275,17 @@ const KEEP_SMALL_BYTES: usize = 1 << 20;
 /// while the same text is still to be read elsewhere (in the timeline): that read reuses it.
 pub fn step_import_shared(text: &str) -> Result<std::sync::Arc<StepImport>> {
     let key = text_key(text);
-    if let Ok(cache) = RECENT.lock()
-        && let Some(imp) = cache.iter().filter(|r| r.key == key).find_map(|r| r.import.upgrade())
-    {
+    if let Some(imp) = recent(key) {
         return Ok(imp);
     }
     let imp = std::sync::Arc::new(step_import(text)?);
     remember(key, &imp, text.len() <= KEEP_SMALL_BYTES);
     Ok(imp)
+}
+
+/// The import the recent imports still hold for `key`.
+fn recent(key: (u64, usize)) -> Option<Arc<StepImport>> {
+    RECENT.lock().ok()?.iter().filter(|r| r.key == key).find_map(|r| r.import.upgrade())
 }
 
 /// The cache key of a STEP text: its hash and length.
