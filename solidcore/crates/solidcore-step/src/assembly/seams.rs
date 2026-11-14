@@ -16,9 +16,9 @@
 //!
 //! A face bounded by a slit alone (a loop out along edges and straight back, of no (u, v) area)
 //! on a closed surface is all of that surface less a cut of none: its slit is made its seams
-//! ([`Builder::complete_slits`]), so the loop bounds the surface's whole (u, v) domain. A slit that
+//! ([`Assembly::complete_slits`]), so the loop bounds the surface's whole (u, v) domain. A slit that
 //! is only one bound of a face with another loop encloses nothing of it either, and is left out
-//! of the face ([`Builder::drop_inner_slits`]).
+//! of the face ([`Assembly::drop_inner_slits`]).
 
 use crate::vec::Vec3Geom as _;
 use std::f64::consts::{PI, TAU};
@@ -28,7 +28,7 @@ use solidcore::nurbs::math::gamma;
 use solidcore_record::Vec3;
 use solidcore_record::brep::{Curve as BCurve, Frame, Surface as BSurface, Vertex};
 
-use super::{Builder, EdgeB, LoopB, R, index, unsupported};
+use super::{Assembly, Bound, EdgeB, R, index, unsupported};
 
 /// Samples per edge when following a loop around the axis.
 const SAMPLES: usize = 16;
@@ -54,7 +54,7 @@ fn wrap_by(x: f64, period: f64) -> f64 {
 /// The path a slit runs out along: a loop that runs out along a chain of edges and straight back
 /// along it, each edge used once each way, started at one of its two turns; `None` for any
 /// other loop.
-pub(super) fn slit_path(es: &[(u32, bool)]) -> Option<Vec<(u32, bool)>> {
+pub(crate) fn slit_path(es: &[(u32, bool)]) -> Option<Vec<(u32, bool)>> {
     let n = es.len();
     if n < 2 || !n.is_multiple_of(2) || !super::seam_only(es) {
         return None;
@@ -280,13 +280,13 @@ fn restarted(surface: &BSurface, s: f64, period: f64) -> Option<BSurface> {
     })
 }
 
-impl Builder<'_, '_> {
+impl Assembly<'_> {
     /// Start every B-spline surface closed around u that a face lies across the start of, without
     /// winding round it, in the middle of the widest stretch of u the face leaves free: the face's
     /// pcurves then run inside the surface's knots, as a kernel's trims have to (one crossing the
     /// start had its pcurve clamped there, mm off its edge). Exact ([`restarted`]). Returns how
     /// many surfaces were started anew.
-    pub(super) fn start_splines_clear_of_faces(&mut self) -> R<usize> {
+    pub(crate) fn start_splines_clear_of_faces(&mut self) -> R<usize> {
         let mut turned = 0;
         for fi in 0..self.faces.len() {
             let Some(face) = self.faces.get(fi) else { continue };
@@ -303,7 +303,7 @@ impl Builder<'_, '_> {
             let mut widest: Option<(f64, f64)> = None;
             let mut winds = false;
             for l in &face.loops {
-                let LoopB::Edges(es) = l else { continue };
+                let Bound::Edges(es) = l else { continue };
                 winds |= self.winding(&eval, es, [Some(period), None], &poles)?[0] != 0;
                 let mut last: Option<f64> = None;
                 let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -347,7 +347,7 @@ impl Builder<'_, '_> {
 
     /// Give every face that winds around its surface without a seam one. Returns how many
     /// seams were added.
-    pub(super) fn add_seams(&mut self) -> R<usize> {
+    pub(crate) fn add_seams(&mut self) -> R<usize> {
         let mut added = 0;
         let mut splits = 0;
         for fi in 0..self.faces.len() {
@@ -370,14 +370,14 @@ impl Builder<'_, '_> {
             let v_turns = matches!(surface, BSurface::Torus { .. }) || found.as_ref().is_some_and(|ax| ax.kind.winds_in() == 1);
             let mut tube = false;
             for (li, l) in face.loops.iter().enumerate() {
-                let LoopB::Edges(es) = l else { continue };
+                let Bound::Edges(es) = l else { continue };
                 let mut w = self.winding(&eval, es, periods, &poles)?;
                 if v_turns && w[0] == 0 && w[1].abs() == 1 {
                     tube = true;
                     w = [w[1], 0];
                 }
                 if w[1] != 0 || w[0].abs() > 1 {
-                    return Err(format!("face #{}: {}", face.step, unsupported("a loop winding around a surface more than once or in v")));
+                    return Err(format!("face #{}: {}", face.origin, unsupported("a loop winding around a surface more than once or in v")));
                 }
                 // A loop through a pole turns once round the axis and closes there, where every
                 // angle is one point: a cone's base circle with its seam out to the apex and
@@ -394,7 +394,7 @@ impl Builder<'_, '_> {
             if up.is_empty() && down.is_empty() {
                 continue;
             }
-            let step = face.step;
+            let step = face.origin;
             let found = match found {
                 Some(ax) if tube && matches!(ax.kind, Kind::Torus { .. }) => Some(Axis { kind: Kind::TorusTube, ..ax }),
                 f => f,
@@ -421,7 +421,7 @@ impl Builder<'_, '_> {
     /// vertex just past it. On the face's parameters the pole is a line, along which the edge's
     /// pcurve would have to jump half a turn; split there, the jump is at a vertex on the pole,
     /// where a loop may run along the pole's line. Returns how many edges were split.
-    pub(super) fn split_at_poles(&mut self) -> R<usize> {
+    pub(crate) fn split_at_poles(&mut self) -> R<usize> {
         let mut splits = 0;
         for fi in 0..self.faces.len() {
             let Some(face) = self.faces.get(fi) else { continue };
@@ -431,7 +431,7 @@ impl Builder<'_, '_> {
                 continue;
             }
             let mut edges: Vec<u32> =
-                face.loops.iter().filter_map(|l| if let LoopB::Edges(es) = l { Some(es) } else { None }).flatten().map(|u| u.0).collect();
+                face.loops.iter().filter_map(|l| if let Bound::Edges(es) = l { Some(es) } else { None }).flatten().map(|u| u.0).collect();
             edges.sort_unstable();
             edges.dedup();
             for e in edges {
@@ -535,7 +535,7 @@ impl Builder<'_, '_> {
 
     /// Edge loop `li` of face `fi`, rotated to start at its use `k`.
     fn rotated(&self, fi: usize, li: usize, k: usize) -> R<Vec<(u32, bool)>> {
-        let Some(LoopB::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
+        let Some(Bound::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
         Ok(es.iter().skip(k).chain(es.iter().take(k)).copied().collect())
     }
 
@@ -681,26 +681,26 @@ impl Builder<'_, '_> {
     /// slit's edges: the slit lies inside the face and takes nothing from it, but the portable
     /// B-rep refuses a loop of no area, and with it the face and the solid. Returns how many
     /// bounds were left out.
-    pub(super) fn drop_inner_slits(&mut self) -> usize {
+    pub(crate) fn drop_inner_slits(&mut self) -> usize {
         let mut uses: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         for face in &self.faces {
             for l in &face.loops {
-                if let LoopB::Edges(es) = l {
+                if let Bound::Edges(es) = l {
                     for (e, _) in es {
                         *uses.entry(*e).or_default() += 1;
                     }
                 }
             }
         }
-        let alone = |l: &LoopB| match l {
-            LoopB::Edges(es) => es.len() >= 2 && slit_path(es).is_some() && es.iter().all(|(e, _)| uses.get(e).copied() == Some(2)),
-            LoopB::Vertex(_) => false,
+        let alone = |l: &Bound| match l {
+            Bound::Edges(es) => es.len() >= 2 && slit_path(es).is_some() && es.iter().all(|(e, _)| uses.get(e).copied() == Some(2)),
+            Bound::Vertex(_) => false,
         };
         let mut dropped = 0;
         for face in &mut self.faces {
             let slit: Vec<bool> = face.loops.iter().enumerate().map(|(i, l)| face.outer != Some(i) && alone(l)).collect();
             let count = slit.iter().filter(|s| **s).count();
-            // A face of slits alone is a whole closed surface ([`Builder::complete_slits`]).
+            // A face of slits alone is a whole closed surface ([`Assembly::complete_slits`]).
             if count == 0 || count == face.loops.len() {
                 continue;
             }
@@ -726,13 +726,13 @@ impl Builder<'_, '_> {
     /// lies along is run on from its ends to the poles, out and back; on a torus, the circle the
     /// slit lies along (round the tube or round the axis) is closed and the other circle through
     /// its start is the second seam. Returns how many faces were completed.
-    pub(super) fn complete_slits(&mut self) -> R<usize> {
+    pub(crate) fn complete_slits(&mut self) -> R<usize> {
         let mut completed = 0;
         for fi in 0..self.faces.len() {
             let Some(face) = self.faces.get(fi) else { continue };
-            let [LoopB::Edges(es)] = face.loops.as_slice() else { continue };
+            let [Bound::Edges(es)] = face.loops.as_slice() else { continue };
             let Some(path) = slit_path(es) else { continue };
-            let (step, surface) = (face.step, face.surface.clone());
+            let (step, surface) = (face.origin, face.surface.clone());
             let (merged, seated) = match &surface {
                 BSurface::Torus { frame, major_radius, .. } => (self.torus_slit(&path, frame, *major_radius)?, None),
                 _ => match self.closed_at_poles(&path, &surface)? {
@@ -758,7 +758,7 @@ impl Builder<'_, '_> {
                 face.surface = s;
                 face.extent = None;
             }
-            if let Some(LoopB::Edges(es)) = face.loops.first_mut() {
+            if let Some(Bound::Edges(es)) = face.loops.first_mut() {
                 *es = merged;
             }
             completed += 1;
@@ -767,7 +767,7 @@ impl Builder<'_, '_> {
     }
 
     /// The slit made the meridian seam of `surface` when it is a surface of revolution closed
-    /// at both poles ([`Builder::meridian_slit`]); `None` for any other surface.
+    /// at both poles ([`Assembly::meridian_slit`]); `None` for any other surface.
     fn closed_at_poles(&mut self, path: &[(u32, bool)], surface: &BSurface) -> R<Option<Option<Vec<(u32, bool)>>>> {
         let eval = SurfaceEval::new(surface).map_err(|e| e.to_string())?;
         match axis(surface).or_else(|| spline_axis(surface, &eval)) {
@@ -954,11 +954,11 @@ impl Builder<'_, '_> {
 
     /// Join loop `li` of face `fi` to the pole the face covers: seam out and back.
     fn pole_seam(&mut self, fi: usize, li: usize, ax: &Axis, pole: Option<Vec3>, eval: &SurfaceEval) -> R<()> {
-        let step = self.faces.get(fi).map_or(0, |f| f.step);
+        let step = self.faces.get(fi).map_or(0, |f| f.origin);
         let Some(p) = pole else {
             return Err(format!("face #{step}: a face around an open surface of revolution with one bound"));
         };
-        let Some(LoopB::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
+        let Some(Bound::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
         let es = es.clone();
         // Start at a vertex off the pole.
         let mut k = None;
@@ -978,8 +978,8 @@ impl Builder<'_, '_> {
         // The face's vertex loop at the pole, if it has one, else a new vertex there.
         let face = self.faces.get(fi).ok_or("face reference")?;
         let at_pole = face.loops.iter().enumerate().find_map(|(i, l)| match l {
-            LoopB::Vertex(v) => self.vertices.get(*v as usize).filter(|x| Vec3::from(x.point).dist(p) <= self.tol.max(x.tolerance)).map(|_| (i, *v)),
-            LoopB::Edges(_) => None,
+            Bound::Vertex(v) => self.vertices.get(*v as usize).filter(|x| Vec3::from(x.point).dist(p) <= self.tol.max(x.tolerance)).map(|_| (i, *v)),
+            Bound::Edges(_) => None,
         });
         let b = match at_pole {
             Some((_, v)) => v,
@@ -995,7 +995,7 @@ impl Builder<'_, '_> {
         merged.push((seam, !along));
         let face = self.faces.get_mut(fi).ok_or("face reference")?;
         if let Some(l) = face.loops.get_mut(li) {
-            *l = LoopB::Edges(merged);
+            *l = Bound::Edges(merged);
         }
         if let Some((i, _)) = at_pole {
             remove_loop(face, i, li);
@@ -1011,7 +1011,7 @@ impl Builder<'_, '_> {
             let p = s.vpoint(v)?;
             eval.project(p, None, f64::INFINITY).and_then(|q| q.get(d).copied()).ok_or_else(|| "a vertex off its surface".to_string())
         };
-        let (Some(LoopB::Edges(a_es)), Some(LoopB::Edges(b_es))) =
+        let (Some(Bound::Edges(a_es)), Some(Bound::Edges(b_es))) =
             (self.faces.get(fi).and_then(|f| f.loops.get(la)), self.faces.get(fi).and_then(|f| f.loops.get(lb)))
         else {
             return Err("loop reference".into());
@@ -1142,7 +1142,7 @@ impl Builder<'_, '_> {
         merged.push((seam, !along));
         let face = self.faces.get_mut(fi).ok_or("face reference")?;
         if let Some(l) = face.loops.get_mut(la) {
-            *l = LoopB::Edges(merged);
+            *l = Bound::Edges(merged);
         }
         remove_loop(face, lb, la);
         Ok(())
@@ -1205,7 +1205,7 @@ impl Builder<'_, '_> {
 
     /// The index of the use of loop `li` of face `fi` that starts at vertex `v`.
     fn use_at(&self, fi: usize, li: usize, v: u32) -> R<usize> {
-        let Some(LoopB::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
+        let Some(Bound::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
         for (k, u) in es.iter().enumerate() {
             if self.start(*u)? == v {
                 return Ok(k);
@@ -1235,11 +1235,11 @@ impl Builder<'_, '_> {
         let mut arcs = Vec::new();
         for (li, l) in face.loops.iter().enumerate() {
             let es = match l {
-                LoopB::Vertex(v) => {
+                Bound::Vertex(v) => {
                     arcs.push(frame.point_arc(self.vpoint(*v)?, self.tol));
                     continue;
                 }
-                LoopB::Edges(es) => es,
+                Bound::Edges(es) => es,
             };
             // The loop's pieces in its order, each with the way its angle runs along the loop.
             let mut pieces: Vec<Piece> = Vec::new();
@@ -1279,7 +1279,7 @@ impl Builder<'_, '_> {
     /// `start` (the column at u = `start`, or the row at v = `start` for one closed in v): a vertex there
     /// within the tolerance, else one made by splitting the loop's edge that crosses it.
     fn seam_start(&mut self, fi: usize, li: usize, start: f64, ax: &Axis, eval: &SurfaceEval) -> R<usize> {
-        let Some(LoopB::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
+        let Some(Bound::Edges(es)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
         let es = es.clone();
         let d = ax.kind.winds_in();
         let on_seam = |s: &Self, v: u32| -> R<bool> {
@@ -1296,7 +1296,7 @@ impl Builder<'_, '_> {
         for &(e, _) in &es {
             if let Some(t) = self.crossing(e, d, start, ax.period, eval)? {
                 let v = self.split_edge(e, t)?;
-                let Some(LoopB::Edges(now)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
+                let Some(Bound::Edges(now)) = self.faces.get(fi).and_then(|f| f.loops.get(li)) else { return Err("loop reference".into()) };
                 for (k, u) in now.iter().enumerate() {
                     if self.start(*u)? == v {
                         return Ok(k);
@@ -1328,7 +1328,7 @@ impl Builder<'_, '_> {
         self.edges.push(EdgeB { curve, interval: [t, hi], vertices: [v, b], tolerance, form: None });
         for f in &mut self.faces {
             for l in &mut f.loops {
-                let LoopB::Edges(es) = l else { continue };
+                let Bound::Edges(es) = l else { continue };
                 if !es.iter().any(|u| u.0 == e) {
                     continue;
                 }
@@ -1363,7 +1363,7 @@ fn remove_loop(face: &mut super::FaceB, gone: usize, kept: usize) {
 }
 
 /// Directions square to an axis, to measure angles about it.
-pub(super) struct Perpendicular {
+pub(crate) struct Perpendicular {
     origin: Vec3,
     x: Vec3,
     y: Vec3,
@@ -1375,7 +1375,7 @@ impl Perpendicular {
     }
 
     /// Directions square to the axis through `origin` along unit `z`.
-    pub(super) fn about(origin: Vec3, z: Vec3) -> Self {
+    pub(crate) fn about(origin: Vec3, z: Vec3) -> Self {
         let pick = if z.x.abs() <= z.y.abs() && z.x.abs() <= z.z.abs() {
             Vec3::new(1.0, 0.0, 0.0)
         } else if z.y.abs() <= z.z.abs() {
@@ -1397,7 +1397,7 @@ impl Perpendicular {
     /// form, [`crate::kernel::form::curve`]): each piece's arc of angles and the way its angle
     /// runs, a piece that reaches half a turn in halves ([`MAX_HALVINGS`]); the whole turn where a
     /// hull is still not clear of the axis.
-    pub(super) fn pieces(&self, curve: &BCurve, interval: [f64; 2], tol: f64) -> Vec<Piece> {
+    pub(crate) fn pieces(&self, curve: &BCurve, interval: [f64; 2], tol: f64) -> Vec<Piece> {
         let whole = || vec![Piece { arc: [0.0, TAU], pad: 0.0, runs: None }];
         let form = match curve {
             BCurve::Spline { .. } | BCurve::RationalSpline { .. } => Some((curve.clone(), interval)),
@@ -1460,7 +1460,7 @@ impl Perpendicular {
     /// distance over their radius) and `tol` at the smallest radius the points' hull reaches (the
     /// least radius times the cosine of half the arc, as their convex hull lies within the wedge).
     /// `None` when a point is not finite or on the axis, or they reach half a turn.
-    pub(super) fn span(&self, points: &[Vec3], tol: f64) -> Option<([f64; 2], f64)> {
+    pub(crate) fn span(&self, points: &[Vec3], tol: f64) -> Option<([f64; 2], f64)> {
         let first = *points.first()?;
         let a0 = self.angle(first);
         let (mut lo, mut hi, mut least, mut far) = (0.0f64, 0.0f64, f64::INFINITY, 0.0f64);
@@ -1498,7 +1498,7 @@ impl Perpendicular {
 
 /// A Bézier piece of a loop's edge: the arc of angles about the axis it lies within, and the
 /// way its angle runs along the loop (1 up, -1 down; `None` where it is not certainly one way).
-pub(super) struct Piece {
+pub(crate) struct Piece {
     arc: [f64; 2],
     /// How far its arc is widened where it blocks a seam ([`Perpendicular::span`]).
     pad: f64,
@@ -1507,7 +1507,7 @@ pub(super) struct Piece {
 
 impl Piece {
     /// The arc the piece blocks: its own, widened by its pad.
-    pub(super) fn blocked(&self) -> [f64; 2] {
+    pub(crate) fn blocked(&self) -> [f64; 2] {
         padded(self.arc, self.pad)
     }
 }
@@ -1527,7 +1527,7 @@ fn padded([a, b]: [f64; 2], pad: f64) -> [f64; 2] {
 /// the angle runs that way over the whole piece. A coefficient's sign counts only where it
 /// exceeds its rounding, `γ_K` of the sum of its terms' magnitudes (a ruling's coefficients
 /// are 0, computed as a rounding either way): otherwise `None`.
-pub(super) fn angular_sign(a: &[[f64; 2]]) -> Option<i8> {
+pub(crate) fn angular_sign(a: &[[f64; 2]]) -> Option<i8> {
     let n = a.len().checked_sub(1).filter(|n| *n > 0)?;
     let binomial = |n: usize, k: usize| -> f64 { (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64) };
     // Each coefficient: n + 1 terms of a binomial ratio (3n operations at most), a difference, a
@@ -1580,14 +1580,14 @@ fn overlap(p: [f64; 2], q: [f64; 2]) -> Vec<[f64; 2]> {
     out
 }
 
-/// Arcs of angle about an axis that a face's other loops can reach ([`Builder::blocked_angles`]).
-pub(super) struct Blocked {
-    pub(super) arcs: Vec<[f64; 2]>,
+/// Arcs of angle about an axis that a face's other loops can reach ([`Assembly::blocked_angles`]).
+pub(crate) struct Blocked {
+    pub(crate) arcs: Vec<[f64; 2]>,
 }
 
 impl Blocked {
     /// `angle` is outside every arc.
-    pub(super) fn clear(&self, angle: f64) -> bool {
+    pub(crate) fn clear(&self, angle: f64) -> bool {
         self.arcs.iter().all(|[a, b]| (angle - a).rem_euclid(TAU) > b - a)
     }
 

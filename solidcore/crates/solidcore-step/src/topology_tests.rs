@@ -6,7 +6,10 @@
 use std::fmt::Write as _;
 
 use super::*;
+use crate::assembly::{OPEN_DOMAIN_SPAN, face_domain, onto_form, seams};
 use crate::p21;
+use solidcore_ops::pcurve::TrimFace;
+use solidcore_record::brep::{Curve2, EdgeUseRef, Face, Loop, Region, Shell};
 
 type V = [f64; 3];
 
