@@ -3909,16 +3909,33 @@ fn take_upload_failure() -> Option<String> {
 /// refused the buffer, with the reason kept for [`take_upload_failure`] so the whole scene's
 /// upload can fail and leave the previous picture in place.
 fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
-    match crate::buffer_init(device, label, contents, usage) {
+    buffer_init_with_room(device, label, contents, 0, usage)
+}
+
+/// [`buffer_init`] with room for `room` bytes, only `contents` written
+/// ([`crate::buffer_init_with_room`]).
+fn buffer_init_with_room(device: &wgpu::Device, label: &str, contents: &[u8], room: u64, usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+    match crate::buffer_init_with_room(device, label, contents, room, usage) {
         Ok(buffer) => Some(buffer),
         Err(error) => {
-            let reason = error.to_string();
-            UPLOAD_FAILURE.with(|f| {
-                f.borrow_mut().get_or_insert(reason);
-            });
+            upload_failed(error.to_string());
             None
         }
     }
+}
+
+/// Keep `reason` (the first one) for [`take_upload_failure`]: the scene's upload fails and the
+/// previous picture stays.
+fn upload_failed(reason: String) {
+    UPLOAD_FAILURE.with(|f| {
+        f.borrow_mut().get_or_insert(reason);
+    });
+}
+
+/// Whether `device` draws instanced meshes indirectly, from one arena of every shared mesh
+/// ([`indirect`]); elsewhere each mesh has buffers of its own.
+pub fn draws_indirectly(device: &wgpu::Device) -> bool {
+    indirect::supported(device)
 }
 
 /// Bytes per GPU buffer for vertices of `stride` bytes: within the device's limit and a

@@ -892,6 +892,12 @@ impl OffscreenFrames {
         self.resources.get::<Renderer>().map(Renderer::target)
     }
 
+    /// Whether the device draws instanced meshes indirectly, from one arena of every shared mesh
+    /// ([`solidcraft_viewport_gpu::view::draws_indirectly`]).
+    pub(crate) fn draws_indirectly(&self) -> bool {
+        solidcraft_viewport_gpu::view::draws_indirectly(&self.device)
+    }
+
     /// Whether the device evaluates plans (so scenes should be built with `tess`).
     pub(crate) fn tessellates(&self) -> bool {
         self.resources.get::<Renderer>().is_some_and(|r| r.target().tess)

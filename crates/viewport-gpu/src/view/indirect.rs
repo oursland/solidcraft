@@ -58,9 +58,19 @@ pub(super) struct Arena {
     indices: wgpu::Buffer,
     /// The buffers' sizes (bytes: vertices, indices).
     room: [u64; 2],
-    /// Bytes of each buffer taken by any arena over them (the rest is free).
-    taken: Arc<std::sync::Mutex<[u64; 2]>>,
+    /// What every arena over these buffers has written to them.
+    mark: Arc<std::sync::Mutex<Mark>>,
+    /// The meshes this arena's scene draws, and where each is.
     spans: HashMap<usize, (Arc<SharedTris>, Span)>,
+}
+
+/// What the arenas over one pair of buffers have written there.
+struct Mark {
+    /// Bytes of each buffer taken (the rest is free).
+    taken: [u64; 2],
+    /// Every mesh written there, drawn now or not, and where: a mesh a scene stops drawing for a
+    /// while is still there when a later scene draws it again, until the buffers are made again.
+    resident: HashMap<usize, (Arc<SharedTris>, Span)>,
 }
 
 /// Bytes of a mesh in the arena: vertices, indices.
@@ -68,14 +78,20 @@ fn mesh_bytes(m: &SharedTris) -> [u64; 2] {
     [m.vertices.len() as u64, m.indices.len() as u64 * 4]
 }
 
+/// Where `mesh` is in `spans`, when it is there (the very mesh, not another at its address).
+fn span_in(spans: &HashMap<usize, (Arc<SharedTris>, Span)>, mesh: &Arc<SharedTris>) -> Option<Span> {
+    spans.get(&(Arc::as_ptr(mesh) as usize)).filter(|(m, _)| Arc::ptr_eq(m, mesh)).map(|(_, s)| *s)
+}
+
 impl Arena {
     /// An arena holding `meshes` (each once; a mesh with no triangles, or one too large for a
     /// buffer, is left to be drawn on its own), with the bytes it uploaded. `before`'s buffers
-    /// are kept when the meshes it lacks fit in their room and the meshes it held but no longer
-    /// draws take no more than the meshes drawn (they are let go when the buffers are made
+    /// are kept when the meshes they lack fit in their room and the meshes they hold but no
+    /// longer draw take no more than the meshes drawn (they are let go when the buffers are made
     /// again). New buffers have room for half as many again. Meshes beyond what one buffer
     /// holds are left out (drawn on their own). `None` when there is nothing to hold or the
-    /// device refused the buffers.
+    /// device refused the buffers or a write to them (the refusal kept for the scene upload,
+    /// [`super::take_upload_failure`]).
     pub(super) fn holding(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -101,71 +117,90 @@ impl Arena {
             return None;
         }
         if let Some(before) = before {
-            let lacking: Vec<&Arc<SharedTris>> = wanted.iter().copied().filter(|m| before.span(m).is_none()).collect();
-            if lacking.is_empty() && before.spans.len() == wanted.len() {
+            if wanted.iter().all(|m| before.span(m).is_some()) && before.spans.len() == wanted.len() {
                 return Some((before.clone(), 0));
             }
-            if let Some(grown) = before.with(queue, &wanted, &lacking, need) {
-                return Some(grown);
+            match before.with(device, queue, &wanted, need) {
+                Ok(Some(grown)) => return Some(grown),
+                Ok(None) => {}
+                Err(reason) => {
+                    super::upload_failed(reason);
+                    return None;
+                }
             }
         }
         Arena::new(device, &wanted, need, limit)
     }
 
-    /// `before`'s buffers holding `wanted`, the `lacking` ones written into their room; `None`
-    /// when they do not fit there or the buffers would hold more no longer drawn than drawn.
-    fn with(&self, queue: &wgpu::Queue, wanted: &[&Arc<SharedTris>], lacking: &[&Arc<SharedTris>], need: [u64; 2]) -> Option<(Arc<Arena>, u64)> {
+    /// `self`'s buffers holding `wanted`, those not yet there written into their room; `None`
+    /// when they do not fit there or the buffers would hold more no longer drawn than drawn, and
+    /// an error when the device refused the writes (nothing is published then: the room stays
+    /// free, and the meshes in it are not taken as written).
+    fn with(&self, device: &wgpu::Device, queue: &wgpu::Queue, wanted: &[&Arc<SharedTris>], need: [u64; 2]) -> Result<Option<(Arc<Arena>, u64)>, String> {
+        let Ok(mut mark) = self.mark.lock() else { return Ok(None) };
+        let lacking: Vec<&Arc<SharedTris>> = wanted.iter().copied().filter(|m| span_in(&mark.resident, m).is_none()).collect();
         let add = lacking.iter().fold([0u64; 2], |a, m| {
             let [v, i] = mesh_bytes(m);
             [a[0] + v, a[1] + i]
         });
-        let mut taken = self.taken.lock().ok()?;
-        let at = *taken;
+        let at = mark.taken;
         let after = [at[0] + add[0], at[1] + add[1]];
         if after[0] > self.room[0] || after[1] > self.room[1] || after[0] > 2 * need[0] || after[1] > 2 * need[1] {
-            return None;
+            return Ok(None);
         }
-        let first_index = u32::try_from(at[1] / 4).ok()?;
-        let base_vertex = i32::try_from(at[0] / super::SHARED_SIZE as u64).ok()?;
-        let (vertices, indices, placed) = pack(lacking, first_index, base_vertex)?;
+        let (Ok(first_index), Ok(base_vertex)) = (u32::try_from(at[1] / 4), i32::try_from(at[0] / super::SHARED_SIZE as u64)) else {
+            return Ok(None);
+        };
+        let Some((vertices, indices, placed)) = pack(&lacking, first_index, base_vertex) else { return Ok(None) };
         if !vertices.is_empty() {
+            // Both writes, or neither taken as made: a refused staging allocation is an error
+            // here, not a span over indices never written.
+            let scopes = crate::error_scopes(device);
             queue.write_buffer(&self.vertices, at[0], &vertices);
             queue.write_buffer(&self.indices, at[1], &indices);
-        }
-        *taken = after;
-        drop(taken);
-        let mut spans = HashMap::with_capacity(wanted.len());
-        for m in wanted {
-            let key = Arc::as_ptr(m) as usize;
-            if let Some(span) = self.span(m).or_else(|| placed.get(&key).copied()) {
-                spans.insert(key, (Arc::clone(m), span));
+            if let Some(error) = crate::caught(scopes) {
+                return Err(error);
             }
         }
-        let arena = Arena { vertices: self.vertices.clone(), indices: self.indices.clone(), room: self.room, taken: self.taken.clone(), spans };
-        Some((Arc::new(arena), add[0] + add[1]))
+        mark.taken = after;
+        for m in &lacking {
+            let key = Arc::as_ptr(m) as usize;
+            if let Some(span) = placed.get(&key) {
+                mark.resident.insert(key, (Arc::clone(m), *span));
+            }
+        }
+        let spans = wanted
+            .iter()
+            .filter_map(|m| span_in(&mark.resident, m).map(|span| (Arc::as_ptr(m) as usize, (Arc::clone(m), span))))
+            .collect();
+        drop(mark);
+        let arena = Arena { vertices: self.vertices.clone(), indices: self.indices.clone(), room: self.room, mark: self.mark.clone(), spans };
+        Ok(Some((Arc::new(arena), add[0] + add[1])))
     }
 
     /// New buffers holding `wanted` (`need` bytes), with room for half as many again (within
-    /// `limit`).
+    /// `limit`, aligned down so the padded size stays within it). Only the meshes are written;
+    /// the room is allocated, not uploaded.
     fn new(device: &wgpu::Device, wanted: &[&Arc<SharedTris>], need: [u64; 2], limit: u64) -> Option<(Arc<Arena>, u64)> {
-        let (mut vertices, mut indices, placed) = pack(wanted, 0, 0)?;
-        let room = need.map(|n| (n.saturating_add(n / 2)).min(limit).max(n).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT));
-        vertices.resize(usize::try_from(room[0]).ok()?, 0);
-        indices.resize(usize::try_from(room[1]).ok()?, 0);
-        let spans =
+        let (vertices, indices, placed) = pack(wanted, 0, 0)?;
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let cap = limit / align * align;
+        let room = need.map(|n| n.saturating_add(n / 2).min(cap).max(n).next_multiple_of(align));
+        let spans: HashMap<usize, (Arc<SharedTris>, Span)> =
             wanted.iter().filter_map(|m| placed.get(&(Arc::as_ptr(m) as usize)).map(|s| (Arc::as_ptr(m) as usize, (Arc::clone(m), *s)))).collect();
+        let usage = |u| u | wgpu::BufferUsages::COPY_DST;
         let arena = Arena {
-            vertices: super::buffer_init(device, "sc_indirect_vertices", &vertices, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST)?,
-            indices: super::buffer_init(device, "sc_indirect_indices", &indices, wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST)?,
+            vertices: super::buffer_init_with_room(device, "sc_indirect_vertices", &vertices, room[0], usage(wgpu::BufferUsages::VERTEX))?,
+            indices: super::buffer_init_with_room(device, "sc_indirect_indices", &indices, room[1], usage(wgpu::BufferUsages::INDEX))?,
             room,
-            taken: Arc::new(std::sync::Mutex::new(need)),
+            mark: Arc::new(std::sync::Mutex::new(Mark { taken: need, resident: spans.clone() })),
             spans,
         };
         Some((Arc::new(arena), need[0] + need[1]))
     }
 
     fn span(&self, mesh: &Arc<SharedTris>) -> Option<Span> {
-        self.spans.get(&(Arc::as_ptr(mesh) as usize)).filter(|(m, _)| Arc::ptr_eq(m, mesh)).map(|(_, s)| *s)
+        span_in(&self.spans, mesh)
     }
 
     /// Where `mesh` is drawn from, when the arena holds it: its buffers, and its span.

@@ -70,7 +70,7 @@ fn popped(f: impl std::future::Future<Output = Option<wgpu::Error>>) -> Option<w
 }
 
 /// Error scopes catching what GPU work may raise (popped by [`caught`]).
-fn error_scopes(device: &wgpu::Device) -> [wgpu::ErrorScopeGuard; 3] {
+pub(crate) fn error_scopes(device: &wgpu::Device) -> [wgpu::ErrorScopeGuard; 3] {
     [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f))
 }
 
@@ -98,7 +98,7 @@ pub fn describe_error(error: &wgpu::Error) -> String {
 }
 
 /// The error the scopes caught ([`preferred_error`]), described.
-fn caught(scopes: [wgpu::ErrorScopeGuard; 3]) -> Option<String> {
+pub(crate) fn caught(scopes: [wgpu::ErrorScopeGuard; 3]) -> Option<String> {
     preferred_error(scopes.into_iter().rev().filter_map(|scope| popped(scope.pop()))).as_ref().map(describe_error)
 }
 
@@ -107,7 +107,13 @@ fn caught(scopes: [wgpu::ErrorScopeGuard; 3]) -> Option<String> {
 /// anything is written to it. The size is padded to [`wgpu::COPY_BUFFER_ALIGNMENT`] (at least
 /// one word), as `create_buffer_init` pads it.
 pub fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
-    let len = contents.len() as u64;
+    buffer_init_with_room(device, label, contents, 0, usage)
+}
+
+/// [`buffer_init`] with room: a buffer of at least `room` bytes (padded as there), of which only
+/// `contents` are written; the rest starts zeroed, and nothing is copied for it.
+pub fn buffer_init_with_room(device: &wgpu::Device, label: &str, contents: &[u8], room: u64, usage: wgpu::BufferUsages) -> Result<wgpu::Buffer> {
+    let len = (contents.len() as u64).max(room);
     let size = (len.div_ceil(wgpu::COPY_BUFFER_ALIGNMENT) * wgpu::COPY_BUFFER_ALIGNMENT).max(wgpu::COPY_BUFFER_ALIGNMENT);
     let scopes = error_scopes(device);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
@@ -117,7 +123,7 @@ pub fn buffer_init(device: &wgpu::Device, label: &str, contents: &[u8], usage: w
     // The whole padded size: a mapped range must be a multiple of the alignment too.
     // The mapped range starts zeroed, so only the contents are copied and the padding stays zero.
     match buffer.get_mapped_range_mut(..size) {
-        // `size` is `contents.len()` rounded up, so the head is always within the range.
+        // `size` is at least `contents.len()`, so the head is always within the range.
         Ok(mut mapped) => mapped.slice(..contents.len()).copy_from_slice(contents),
         Err(error) => return Err(GpuError::Render(error.to_string())),
     }

@@ -298,7 +298,9 @@ fn appearance_edits_upload_palette_rows_only() {
 /// A part placed many times goes to the GPU once: drawn indirectly, its triangles are uploaded
 /// to the indirect draws' buffer alone, not to buffers of their own as well; a scene adding a
 /// part that fits the buffer's room uploads that part's triangles alone, not again every part
-/// before it; and the same parts again upload none. Every placement is drawn each time. Skipped without a GPU adapter.
+/// before it; and the same parts again upload none. Every placement is drawn each time. Skipped
+/// without a GPU adapter, or on a device that does not draw indirectly (each mesh has buffers of
+/// its own there).
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_placed_parts_triangles_are_uploaded_once_and_a_part_added_alone_after() {
@@ -307,6 +309,10 @@ fn a_placed_parts_triangles_are_uploaded_once_and_a_part_added_alone_after() {
         eprintln!("skipping: no GPU adapter");
         return;
     };
+    if !frames.draws_indirectly() {
+        eprintln!("skipping: the device does not draw indirectly");
+        return;
+    }
     let mut app = SolveApp::new(Session::default(), Services::default());
     app.ui.ground_shadow = false;
     app.set_origin_shown(false);
