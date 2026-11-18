@@ -136,7 +136,13 @@ impl Arena {
     /// when they do not fit there or the buffers would hold more no longer drawn than drawn, and
     /// an error when the device refused the writes (nothing is published then: the room stays
     /// free, and the meshes in it are not taken as written).
-    fn with(&self, device: &wgpu::Device, queue: &wgpu::Queue, wanted: &[&Arc<SharedTris>], need: [u64; 2]) -> Result<Option<(Arc<Arena>, u64)>, String> {
+    fn with(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        wanted: &[&Arc<SharedTris>],
+        need: [u64; 2],
+    ) -> Result<Option<(Arc<Arena>, u64)>, String> {
         let Ok(mut mark) = self.mark.lock() else { return Ok(None) };
         let lacking: Vec<&Arc<SharedTris>> = wanted.iter().copied().filter(|m| span_in(&mark.resident, m).is_none()).collect();
         let add = lacking.iter().fold([0u64; 2], |a, m| {
@@ -169,10 +175,7 @@ impl Arena {
                 mark.resident.insert(key, (Arc::clone(m), *span));
             }
         }
-        let spans = wanted
-            .iter()
-            .filter_map(|m| span_in(&mark.resident, m).map(|span| (Arc::as_ptr(m) as usize, (Arc::clone(m), span))))
-            .collect();
+        let spans = wanted.iter().filter_map(|m| span_in(&mark.resident, m).map(|span| (Arc::as_ptr(m) as usize, (Arc::clone(m), span)))).collect();
         drop(mark);
         let arena = Arena { vertices: self.vertices.clone(), indices: self.indices.clone(), room: self.room, mark: self.mark.clone(), spans };
         Ok(Some((Arc::new(arena), add[0] + add[1])))
