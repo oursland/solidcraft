@@ -2481,7 +2481,11 @@ fn body_scene(
         arena.set_material(slots.instance, finish(base, body_pbr));
         let face_looks = &resolved.face_looks;
         let faces = b.body.face_count();
-        let copy_key = copy.map(|(definition, look)| (definition, look, faded, slots.body, slots.faces));
+        // Only copies with face slots of their own reuse the first copy's faces: faces that fall
+        // back to the body's slot (a full palette) write their colours over the body colour
+        // written above, so each copy writes them again.
+        let own_faces = slots.faces != u32::MAX && slots.face_capacity as usize >= faces;
+        let copy_key = copy.filter(|_| own_faces).map(|(definition, look)| (definition, look, faded, slots.body, slots.faces));
         let CopyLook { face_colors, face_classes, look_of, looks } = match copy_key.and_then(|k| copy_looks.get(&k)) {
             Some(made) => made.clone(),
             None => {
@@ -12063,6 +12067,39 @@ mod tests {
         let red = scene.instanced.iter().find(|m| colour(m) == Some([0xcc, 0x22, 0x22])).expect("the red face's look");
         assert_eq!(red.tris.indices.len(), 6, "the red look is the top face alone");
         assert_eq!(scene.instanced.iter().map(|m| m.count()).sum::<usize>(), 10, "every placement in each of its two looks");
+    }
+
+    /// With the palette full, a copy's faces fall back to its body's slot and write their colours
+    /// over the body colour written first: every copy writes them again (none reuses the first
+    /// copy's), so the later copies do not leave the shared slot in the body colour.
+    #[test]
+    fn copies_whose_faces_fall_back_to_the_body_slot_keep_their_face_colours() {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+        app.ui.ground_shadow = false;
+        app.set_origin_shown(false);
+        app.viewport.gpu =
+            Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess: false, oit: false, edges: false });
+        app.run("component.create", json!({"name":"Part"})).unwrap();
+        app.run("solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Block"})).unwrap();
+        let every_face = json!([[5, 5, 0], [5, 5, 10], [5, 0, 5], [5, 10, 5], [0, 5, 5], [10, 5, 5]]);
+        app.run("appearance.assign", json!({"body": "Block", "faces": every_face, "color": "#cc2222"})).unwrap();
+        app.run("component.activate", json!({"component":"root"})).unwrap();
+        for k in 0..4 {
+            app.run("occurrence.copy", json!({"component":"Part","translate":[40.0 * (k as f64 + 1.0),0,0]})).unwrap();
+        }
+        // Room for the slots of two bodies but none for their faces.
+        app.viewport.palette.lock().unwrap_or_else(|e| e.into_inner()).fill_to(crate::gpu::MAX_PALETTE - 8);
+        let st = crate::open_meshing::shown_world(&app);
+        let (scene, _) = body_scene(&app, &st, |_| true, true, &mut std::collections::HashMap::new());
+        let arena = app.viewport.palette.lock().unwrap_or_else(|e| e.into_inner());
+        let copies: Vec<_> = st.bodies.iter().filter(|b| b.placed_definition().is_some() && repeated_copy(&app, b)).collect();
+        assert!(copies.len() >= 4, "the four copies share the part's slots ({} do)", copies.len());
+        for b in copies {
+            let slots = arena.slots(&b.name).expect("the copy's slots");
+            assert_eq!(slots.faces, u32::MAX, "no room for face slots");
+            let drawn = scene.palette.get(slots.body).map(|c| [c[0], c[1], c[2]]);
+            assert_eq!(drawn, Some([0xcc, 0x22, 0x22]), "{}'s faces in their red, not the body colour", b.name);
+        }
     }
 
     /// A part placed by several occurrences is drawn from one copy of its triangles, once per

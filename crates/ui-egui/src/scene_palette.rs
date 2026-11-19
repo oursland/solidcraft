@@ -137,6 +137,13 @@ impl PaletteArena {
         PaletteIndex(i)
     }
 
+    /// Fill the arena with unused entries up to `len`, as a large design would (tests of a full
+    /// palette).
+    #[cfg(test)]
+    pub fn fill_to(&mut self, len: usize) {
+        self.entries.resize(len.min(MAX_PALETTE), [0; 4]);
+    }
+
     /// The slots of `name`, if it has any (nothing is allocated).
     pub fn slots(&self, name: &str) -> Option<BodySlots> {
         self.bodies.get(name).copied()
